@@ -36,3 +36,21 @@ streamlit run nl2sql_app.py
 
 Enter a natural language query and the app will display the generated SQL
 statement and query results from HeatWave.
+
+
+## Example usage
+
+1. Edit the configuration variables at the top of `nl2sql_app.py` to match your HeatWave credentials.
+2. Launch the app:
+
+```bash
+streamlit run nl2sql_app.py
+```
+
+3. When the browser opens, type a question about your data, e.g.:
+
+```text
+Which airlines operate flights from SFO to JFK?
+```
+
+The app will generate a SQL query for your question, execute it and display the results. If the query returns fewer than 25 rows, a short natural language summary is also shown.
