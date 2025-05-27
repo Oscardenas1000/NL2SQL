@@ -2,4 +2,5 @@ streamlit
 mysql-connector-python
 sshtunnel
 pandas
-openai
+numpy
+matplotlib
