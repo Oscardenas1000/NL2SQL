@@ -1,3 +1,5 @@
 streamlit
 mysql-connector-python
+sshtunnel
+pandas
 openai
