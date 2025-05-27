@@ -1,0 +1,3 @@
+streamlit
+mysql-connector-python
+openai
