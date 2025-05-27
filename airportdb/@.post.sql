@@ -1,0 +1,5 @@
+-- MySQLShell dump 2.0.1  Distrib Ver 9.3.0 for Linux on x86_64 - for MySQL 9.3.0 (MySQL Community Server (GPL)), for Linux (x86_64)
+--
+-- Host: 10.0.1.54
+-- ------------------------------------------------------
+-- Server version	9.3.0
