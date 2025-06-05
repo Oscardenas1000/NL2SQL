@@ -35,7 +35,7 @@ DEBUG = False
 
 @st.cache_resource
 def get_db_connection():
-    return mysql.connector.connect(
+    conn = mysql.connector.connect(
         host=DB_HOST,
         port=DB_PORT,
         user=DB_USER,
@@ -45,11 +45,16 @@ def get_db_connection():
         use_pure=True,
         autocommit=True
     )
+    return conn
 
-conn = get_db_connection()
-cursor = conn.cursor()
+def get_safe_cursor():
+    conn = get_db_connection()
+    if not conn.is_connected():
+        conn.reconnect(attempts=3, delay=2)
+    return conn.cursor()
 
 def execute_sql(sql: str) -> pd.DataFrame:
+    cursor = get_safe_cursor()
     if DEBUG:
         st.write(f"Executing SQL: {sql}")
     cursor.execute(sql)
@@ -74,6 +79,7 @@ def extract_clean_sql(raw_response):
     return cleaned.strip()
 
 def translate_to_english(user_input, user_language, model_id):
+    cursor = get_safe_cursor()
     prompt = f"You are a professional translator. Translate the following text into English, keeping meaning intact. Original language: {user_language}. Return only the translation without explanations or markdown."
     text = f"{prompt}\n\n{user_input.strip()}".replace("'", "\\'")
     sql = f"SELECT sys.ML_GENERATE('{text}', JSON_OBJECT('task','generation','model_id','{model_id}','language','en','max_tokens',4000)) AS response;"
@@ -81,6 +87,7 @@ def translate_to_english(user_input, user_language, model_id):
     return extract_clean_sql(cursor.fetchall()[0][0])
 
 def call_ml_generate(question_text, user_language, model_id):
+    cursor = get_safe_cursor()
     if user_language.lower() != 'en':
         question_text = translate_to_english(question_text, user_language, model_id)
     prompt = f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. Return only the SQL without markdown."
@@ -93,6 +100,7 @@ def call_ml_generate(question_text, user_language, model_id):
     return cursor.fetchall()[0][0]
 
 def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_attempts=3):
+    cursor = get_safe_cursor()
     restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE)\b", re.IGNORECASE)
     current = raw_sql_resp
     for _ in range(max_attempts):
@@ -122,6 +130,7 @@ def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_a
     return "❌ Failed to produce valid SQL after retries.", ""
 
 def generate_natural_language_answer(user_question, final_df, user_language, model_id):
+    cursor = get_safe_cursor()
     text_context = (final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df))
     prompt = f"Respond to: {user_question}\nUsing context:\n{text_context}".replace("'", "\\'")
     sql = f"SELECT sys.ML_GENERATE('{prompt}', JSON_OBJECT('task','generation','model_id','{model_id}','language','{user_language}','max_tokens',4000)) AS response;"
@@ -142,28 +151,39 @@ def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
 # --- Streamlit App UI ---
 def main():
     st.title("Natural Language → SQL Chatbot")
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+
     with st.sidebar:
         model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=MODEL_OPTIONS.index(default_model))
         nl_disabled = model_id in restricted_models
         use_nl = st.checkbox("Natural Language Response", value=not nl_disabled, disabled=nl_disabled)
-        max_nl = st.number_input("Max lines for NL Response:", min_value=1, value=24, disabled=not use_nl)
-        language = st.selectbox("Language:", ["en", "es", "pt", "fr"], index=1)
+        max_nl = st.number_input("NL Response Threshold:", min_value=1, value=24, disabled=not use_nl)
+        language = st.selectbox("Language:", ["en", "es", "pt", "fr"], index=0)
         show_sql = st.radio("Show generated SQL?", ["No", "Yes"], index=0)
 
-    question = st.text_input("Your question:")
-    if st.button("Run Query"):
-        if not question:
-            st.warning("Enter a question before running.")
-        else:
+    for msg in st.session_state.messages:
+        with st.chat_message(msg['role']):
+            st.markdown(msg['content'])
+
+    if prompt := st.chat_input("Ask your question..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
             with st.spinner("Running query..."):
-                output, generated_sql = full_pipeline(question, language, model_id, use_nl, max_nl)
+                output, generated_sql = full_pipeline(prompt, language, model_id, use_nl, max_nl)
                 if isinstance(output, pd.DataFrame):
                     st.dataframe(output)
+                    display_output = "✅ Returned a data table."
                 else:
-                    st.write(output)
+                    st.markdown(output)
+                    display_output = output
                 if show_sql == "Yes" and generated_sql:
                     st.sidebar.markdown("### Generated SQL")
                     st.sidebar.code(generated_sql, language='sql')
+        st.session_state.messages.append({"role": "assistant", "content": display_output})
 
     st.markdown("""
         <style>
