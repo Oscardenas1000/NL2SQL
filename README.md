@@ -5,7 +5,23 @@ Oracle HeatWave instance using natural language. The app relies on a large
 language model (LLM) to translate user prompts into SQL queries.
 
 ---
+## VCN Requirements
 
+* VCN must have a minimum of 2 subnets, 1 private and 1 public
+* private subnet must have ports 3306 and 33060 open to traditional HeatWave ports - if other ports are in use for HeatWave, these have to be kept in use through the entirety of the deployment.
+* Public subnet must have port 8501 open to the internet for public access.
+
+
+## Virtual Machine Requirements
+
+* Minimum OS version: RHEL 8
+* Placement within the same VCN as the predetermined HeatWave Database System
+* VM must have internet access as the app will need to be accessable from the public IP.
+* If the app must reside within a private subnet, the VM must still have access to the internet
+
+## OS Setup
+
+This repository includes an executable file named `setup.sh` 
 ## Requirements
 
 * Python 3.11
