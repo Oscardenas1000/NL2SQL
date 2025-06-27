@@ -4,3 +4,5 @@ sshtunnel
 pandas
 numpy
 matplotlib
+seaborn
+setuptools
