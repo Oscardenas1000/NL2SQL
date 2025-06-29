@@ -5,36 +5,41 @@ Oracle HeatWave instance using natural language. The app relies on a large
 language model (LLM) to translate user prompts into SQL queries.
 
 ---
-## VCN Requirements
-
-* VCN must have a minimum of 2 subnets, 1 private and 1 public
-* private subnet must have ports 3306 and 33060 open to traditional HeatWave ports - if other ports are in use for HeatWave, these have to be kept in use through the entirety of the deployment.
-* Public subnet must have port 8501 open to the internet for public access.
-
-
-## Virtual Machine Requirements
-
-* Minimum OS version: RHEL 8
-* Placement within the same VCN as the predetermined HeatWave Database System
-* VM must have internet access as the app will need to be accessable from the public IP.
-* If the app must reside within a private subnet, the VM must still have access to the internet
-
-## OS Setup
-
-This repository includes an executable file named `setup.sh` 
 ## Requirements
+### VCN Requirements
 
-* Python 3.11
-* `streamlit`
-* `mysql-connector-python`
+Before starting the deployment, ensure the following networking setup is in place:
 
-Install the dependencies using:
-
-```bash
-pip install -r requirements.txt
-```
+- The **VCN (Virtual Cloud Network)** must include **at least two subnets**:
+  - One **public subnet**
+  - One **private subnet**
+- The **private subnet** must have the following ports **open to HeatWave**:
+  - `3306` (classic MySQL)
+  - `33060` (MySQL X Protocol)
+  - > ℹ️ *If your HeatWave system uses custom ports, you must consistently use those ports throughout the deployment process.*
+- The **public subnet** must have **port `8501` open to the internet** to allow public access to the app.
 
 ---
+
+### Virtual Machine Requirements
+
+Ensure that your Virtual Machine (VM) meets the following conditions:
+
+- **Operating System**: RHEL 8 or newer
+- **Network Placement**: The VM **must reside in the same VCN** as the pre-configured HeatWave DB system.
+- **Internet Connectivity**:
+  - If the VM is in a **public subnet**, it must be accessible via its public IP.
+  - If deployed in a **private subnet**, it must still have **outbound internet access** (e.g., through a NAT gateway).
+
+---
+
+### OS Setup Instructions
+
+This repository includes an executable setup script:
+
+```bash
+./setup.sh
+ ```
 
 ## Environment Variables
 
