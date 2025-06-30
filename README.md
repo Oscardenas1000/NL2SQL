@@ -16,7 +16,7 @@ Before starting the deployment, ensure the following networking setup is in plac
 - The **private subnet** must have the following ports **open to HeatWave**:
   - `3306` (classic MySQL)
   - `33060` (MySQL X Protocol)
-  - > ℹ️ *If your HeatWave system uses custom ports, you must consistently use those ports throughout the deployment process.*
+    -  ℹ️ *If your HeatWave system uses custom ports, you must consistently use those ports throughout the deployment process.*
 - The **public subnet** must have **port `8501` open to the internet** to allow public access to the app.
 
 ---
