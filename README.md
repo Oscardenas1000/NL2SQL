@@ -42,6 +42,14 @@ To download this repository directly, use the following `wget` command:
 ```bash
 wget https://github.com/Oscardenas1000/NL2SQL/archive/refs/heads/main.zip
 ```
+Unzip the downloaded `main.zip` file
+```bash
+unzip main.zip
+```
+move over into the unziped directory 
+```bash
+cd NL2SQL-main
+```
 
 This repository includes an executable setup script:
 ```bash
