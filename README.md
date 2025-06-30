@@ -33,7 +33,7 @@ Ensure that your Virtual Machine (VM) meets the following conditions:
 
 ---
 
-### OS Setup Instructions
+## OS Setup Instructions
 
 ### Downloading the Repository
 
@@ -42,27 +42,27 @@ To download this repository directly, use the following `wget` command:
 ```bash
 wget https://github.com/Oscardenas1000/NL2SQL/archive/refs/heads/main.zip
 ```
-Unzip the downloaded `main.zip` file
+Once the download is complete, unzip the `main.zip` file:
 ```bash
 unzip main.zip
 ```
-move over into the unziped directory 
+Navigate into the extracted project directory: 
 ```bash
 cd NL2SQL-main
 ```
+### Running the Setup Script
 
-This repository includes an executable setup script:
-```bash
-setup.sh
- ```
-to make this an executable file, perform the following steps: 
+This repository includes an executable setup script named setup.sh.
+
+To make it executable, run:
 ```bash
 chmod +x setup.sh
 ```
-then run
+Then execute the script:
 ```bash
 ./setup.sh
 ```
+
 ---
 
 ## Environment Variables
