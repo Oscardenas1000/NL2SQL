@@ -11,6 +11,17 @@ else
   echo "OCI config already set up."
 fi
 
+# Display the generated public API key to the user
+cat /home/opc/.oci/oci_api_key_public.pem #change path if needed
+
+# Confirmation wait
+read -p "Confirm that you have placed the generated API key in your OCI tenancy console [Y/N]: " usr_conf
+
+if [[ "$usr_conf" = "N" || "$usr_conf" = "n" ]]; then
+  echo " ^}^l Please provide the generated API key in your OCI tenancy console. Exiting."
+  exit 1
+fi
+
 # Ask for HeatWave OCID
 read -p "Enter the OCID of your HeatWave instance: " hw_ocid
 
