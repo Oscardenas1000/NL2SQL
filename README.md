@@ -35,8 +35,14 @@ Ensure that your Virtual Machine (VM) meets the following conditions:
 
 ### OS Setup Instructions
 
-This repository includes an executable setup script:
+### Downloading the Repository
 
+To download this repository directly, use the following `wget` command:
+
+```bash
+```
+
+This repository includes an executable setup script:
 ```bash
 ./setup.sh
  ```
