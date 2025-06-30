@@ -8,7 +8,7 @@ sudo dnf install -y oracle-epel-release-el8
 sudo dnf update -y
 
 echo "Installing Oracle CLI and its dependencies..."
-sudo dnf -y install oraclelinux-developer-releasoci --versione-el8
+#sudo dnf -y install oraclelinux-developer-releasoci --versione-el8
 sudo dnf -y install python36-oci-cli
 
 echo "Installing Development Tools and common build dependencies..."
