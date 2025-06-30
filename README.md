@@ -53,8 +53,17 @@ cd NL2SQL-main
 
 This repository includes an executable setup script:
 ```bash
-./setup.sh
+setup.sh
  ```
+to make this an executable file, perform the following steps: 
+```bash
+chmod +x setup.sh
+```
+then run
+```bash
+./setup.sh
+```
+---
 
 ## Environment Variables
 
