@@ -40,7 +40,7 @@ Ensure that your Virtual Machine (VM) meets the following conditions:
 To download this repository directly, use the following `wget` command:
 
 ```bash
-wget https://github.com/Oscardenas1000/NL2SQL.git
+wget [https://github.com/Oscardenas1000/NL2SQL.git](https://github.com/Oscardenas1000/NL2SQL/archive/refs/heads/main.zip)
 ```
 
 This repository includes an executable setup script:
