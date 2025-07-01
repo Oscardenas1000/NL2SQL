@@ -47,11 +47,11 @@ run_step "Download Python 3.11.9 source" \
 run_step "Extract Python source" \
   "cd /usr/src && sudo tar xzf Python-3.11.9.tgz"
 
+run_step "Clean previous Python build (if any)" \
+  "cd /usr/src/Python-3.11.9 && sudo make clean"
+
 run_step "Configure Python build" \
   "cd /usr/src/Python-3.11.9 && sudo ./configure --enable-optimizations"
-
-run_step "Clean previous build if any" \
-  "cd /usr/src/Python-3.11.9 && sudo make clean"
 
 run_step "Compile Python source" \
   "cd /usr/src/Python-3.11.9 && sudo make -j\$(nproc)"
@@ -89,3 +89,7 @@ echo "✅ Port 8501 is open"
 echo "📦 Installed Python libraries: mysql-connector-python==9.3.0, seaborn, streamlit, setuptools"
 echo "🚀 You can now run: streamlit run app.py"
 echo "📄 Full log saved to: $LOG_FILE"
+
+eco "execute the following commands:"
+echo "chmod +x oci_cli_setup.sh"
+echo "./oci_cli_setup.sh"
