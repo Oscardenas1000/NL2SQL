@@ -100,7 +100,7 @@ def call_ml_generate(question_text, user_language, model_id):
     return cursor.fetchall()[0][0]
 
 def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_attempts=3):
-    cursor = get_safe_cursor()
+    cursor = get_db_connection().cursor()
     restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE)\b", re.IGNORECASE)
     current = raw_sql_resp
     for _ in range(max_attempts):
@@ -125,13 +125,18 @@ def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_a
                 return dfs[0], sql_query
             return pd.concat(dfs, ignore_index=True), sql_query
         except mysql.connector.Error as err:
-            repair_prompt = f"Original intent:\n{original_intent}\nSQL query error:\n{sql_query}\nError: {err}\nPlease regenerate a corrected SELECT-only query."
+            repair_prompt = (
+                f"Original intent:\n{original_intent}\n"
+                f"SQL query error:\n{sql_query}\n"
+                f"Error: {err}\n"
+                "Please regenerate a corrected SELECT-only query."
+            )
             current = call_ml_generate(repair_prompt, 'en', model_id)
     return "❌ Failed to produce valid SQL after retries.", ""
 
 def generate_natural_language_answer(user_question, final_df, user_language, model_id):
     cursor = get_safe_cursor()
-    text_context = (final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df))
+    text_context = final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df)
     prompt = f"Respond to: {user_question}\nUsing context:\n{text_context}".replace("'", "\\'")
     sql = f"SELECT sys.ML_GENERATE('{prompt}', JSON_OBJECT('task','generation','model_id','{model_id}','language','{user_language}','max_tokens',4000)) AS response;"
     cursor.execute(sql)
@@ -147,6 +152,39 @@ def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
         answer = generate_natural_language_answer(user_question, final_result, user_language, model_id)
         return answer, generated_sql
     return final_result, generated_sql
+
+def add_footer():
+    st.markdown(
+        """
+        <style>
+        /* Push the chat-input bar up so we have space for the footer */
+        [data-testid="stChatInput"] {
+            bottom: 60px !important;
+        }
+
+        /* The actual footer */
+        #fixed-footer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            width: 100%;
+            background: #f9f9f9;
+            padding: 10px;
+            font-size: 12px;
+            color: gray;
+            text-align: center;
+            border-top: 1px solid #e0e0e0;
+            z-index: 10000;
+        }
+        </style>
+
+        <div id="fixed-footer">
+            This chatbot can make mistakes; none of the models use this data for training.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # --- Streamlit App UI ---
 def main():
@@ -185,25 +223,8 @@ def main():
                     st.sidebar.code(generated_sql, language='sql')
         st.session_state.messages.append({"role": "assistant", "content": display_output})
 
-    st.markdown("""
-        <style>
-        #fixed-footer {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background-color: #f9f9f9;
-            padding: 10px;
-            font-size: small;
-            color: gray;
-            text-align: center;
-            border-top: 1px solid #e0e0e0;
-        }
-        </style>
-        <div id="fixed-footer">
-            This chatbot can make mistakes; none of the models use this data for training.
-        </div>
-    """, unsafe_allow_html=True)
+    # Add the fixed footer and adjust chat input position
+    add_footer()
 
 if __name__ == "__main__":
     main()
