@@ -188,7 +188,7 @@ def add_footer():
 
 # --- Streamlit App UI ---
 def main():
-    st.title("Natural Language → SQL Chatbot")
+    st.title("Natural Language → SQL Chatbot") # title can be modified
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
@@ -223,7 +223,7 @@ def main():
                     st.sidebar.code(generated_sql, language='sql')
         st.session_state.messages.append({"role": "assistant", "content": display_output})
 
-    # Add the fixed footer and adjust chat input position
+    #fixed footer text
     add_footer()
 
 if __name__ == "__main__":
