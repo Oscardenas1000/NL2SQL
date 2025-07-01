@@ -90,6 +90,6 @@ echo "📦 Installed Python libraries: mysql-connector-python==9.3.0, seaborn, s
 echo "🚀 You can now run: streamlit run app.py"
 echo "📄 Full log saved to: $LOG_FILE"
 
-eco "execute the following commands:"
+echo "execute the following commands:"
 echo "chmod +x oci_cli_setup.sh"
 echo "./oci_cli_setup.sh"
