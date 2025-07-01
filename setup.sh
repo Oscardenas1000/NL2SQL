@@ -82,14 +82,6 @@ run_step "Enable and configure firewalld for Streamlit port" \
    sudo firewall-cmd --reload && \
    sudo firewall-cmd --zone=public --list-ports"
 
-# OCI CLI
-# run_step "Running HeatWave connection script if available" \
-#   "[ -f oci_cli_setup.sh ] && chmod +x oci_cli_setup.sh && ./oci_cli_setup.sh || echo '⚠️ oci_cli_setup.sh not found, skipping...'"
-  
-run_step "Establishing a connection to HeatWave" \
-  "chmod +x oci_cli_setup.sh && \
-   ./oci_cli_setup.sh"
-
 # Completion message
 echo -e "\n🎉 All setup tasks completed!"
 echo "👉 Python version: $(python3 --version)"
