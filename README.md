@@ -1,11 +1,11 @@
 # NL2SQL
 
-This repository contains a minimal Streamlit application for querying an
-Oracle HeatWave instance using natural language. The app relies on a large
-language model (LLM) to translate user prompts into SQL queries.
+This repository contains a minimal Streamlit application for querying an Oracle HeatWave instance using natural language. The app relies on a large language model (LLM) to translate user prompts into SQL queries.
 
 ---
+
 ## Requirements
+
 ### VCN Requirements
 
 Before starting the deployment, ensure the following networking setup is in place:
@@ -16,7 +16,7 @@ Before starting the deployment, ensure the following networking setup is in plac
 - The **private subnet** must have the following ports **open to HeatWave**:
   - `3306` (classic MySQL)
   - `33060` (MySQL X Protocol)
-    -  ℹ️ *If your HeatWave system uses custom ports, you must consistently use those ports throughout the deployment process.*
+    - ℹ️ *If your HeatWave system uses custom ports, ensure these are used consistently throughout the deployment process.*
 - The **public subnet** must have **port `8501` open to the internet** to allow public access to the app.
 
 ---
@@ -29,7 +29,7 @@ Ensure that your Virtual Machine (VM) meets the following conditions:
 - **Network Placement**: The VM **must reside in the same VCN** as the pre-configured HeatWave DB system.
 - **Internet Connectivity**:
   - If the VM is in a **public subnet**, it must be accessible via its public IP.
-  - If deployed in a **private subnet**, it must still have **outbound internet access** (e.g., through a NAT gateway).
+  - If deployed in a **private subnet**, it must still have **outbound internet access** (e.g., via a NAT gateway).
 
 ---
 
@@ -37,31 +37,66 @@ Ensure that your Virtual Machine (VM) meets the following conditions:
 
 ### Downloading the Repository
 
-To download this repository directly, use the following `wget` command:
+To download this repository directly, use the following command:
 
 ```bash
 wget https://github.com/Oscardenas1000/NL2SQL/archive/refs/heads/main.zip
 ```
-Once the download is complete, unzip the `main.zip` file:
+
+Once the download is complete, unzip the file:
+
 ```bash
 unzip main.zip
 ```
-Navigate into the extracted project directory: 
+
+Navigate into the extracted project directory:
+
 ```bash
 cd NL2SQL-main
 ```
+
 ### Running the Setup Script
 
-This repository includes an executable setup script named setup.sh.
+This repository includes an executable setup script named `setup.sh`.
 
 To make it executable, run:
+
 ```bash
 chmod +x setup.sh
 ```
+
 Then execute the script:
+
 ```bash
 ./setup.sh
 ```
+
+### Running OCI CLI Setup Script
+
+To make the script executable, run:
+
+```bash
+chmod +x oci_cli_setup.sh
+```
+
+Then execute it:
+
+```bash
+./oci_cli_setup.sh
+```
+
+Proceed through the OCI CLI setup by providing the following:
+
+- `User OCID`
+- `Tenancy OCID`
+- `Region`
+
+Then provide a path and filename for your OCI CLI configuration file, along with the public and private API keys.
+
+To finalize setup, follow the official Oracle documentation here:
+[Signing Requests with API Key](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#How2) to ensure your API keys are properly configured.
+
+To complete the deployment, supply your `HeatWave_OCID` and credentials so they can be automatically embedded into the app's `.py` file.
 
 ---
 
