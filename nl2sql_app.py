@@ -5,12 +5,12 @@ import pandas as pd
 import json
 
 # --- Configuration ---
-DB_HOST = "10.0.1.54" # Database Host, Auto-populated variable
-DB_PORT = 3306 # Database port, Auto-populated variable
-DB_USER = "admin" # Database user, Auto-populated variable
-DB_PASSWORD = "@Mysqlse2025" # Database user password, Auto-populated variable
-DB_NAME = "airportdb" # Target schema, Auto-populated variable
-DBSYSTEM_SCHEMA = DB_NAME 
+DB_HOST = "10.0.1.54"  # Database Host
+DB_PORT = 3306         # Database port
+DB_USER = "admin"     # Database user
+DB_PASSWORD = "@Mysqlse2025"  # Database password
+DB_NAME = "airportdb" # Target schema
+DBSYSTEM_SCHEMA = DB_NAME
 
 default_model = "meta.llama-3.1-405b-instruct"
 MODEL_OPTIONS = [
@@ -31,36 +31,44 @@ restricted_models = [
     "mistral-7b-instruct-v3"
 ]
 
-DEBUG = False
-
-@st.cache_resource
 def get_db_connection():
-    conn = mysql.connector.connect(
+    """
+    Open a brand-new connection on each call (drop cached connection to allow concurrency).
+    """
+    return mysql.connector.connect(
         host=DB_HOST,
         port=DB_PORT,
         user=DB_USER,
         password=DB_PASSWORD,
         database=DB_NAME,
-        allow_local_infile=True,
-        use_pure=True,
-        autocommit=True
+        ssl_disabled=False,
+        use_pure=True
     )
-    return conn
+
 
 def get_safe_cursor():
+    """
+    Return a fresh cursor and its connection for each query.
+    """
     conn = get_db_connection()
-    if not conn.is_connected():
-        conn.reconnect(attempts=3, delay=2)
-    return conn.cursor()
+    return conn.cursor(), conn
+
 
 def execute_sql(sql: str) -> pd.DataFrame:
-    cursor = get_safe_cursor()
-    if DEBUG:
-        st.write(f"Executing SQL: {sql}")
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    cols = cursor.column_names
-    return pd.DataFrame(rows, columns=cols)
+    """
+    Execute a SQL query using a new cursor/connection per call,
+    ensuring resources are closed promptly.
+    """
+    cursor, conn = get_safe_cursor()
+    try:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        cols = cursor.column_names
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        cursor.close()
+        conn.close()
+
 
 def extract_clean_sql(raw_response):
     if raw_response.startswith("'") and raw_response.endswith("'"):
@@ -78,35 +86,57 @@ def extract_clean_sql(raw_response):
             cleaned = cleaned[:-3]
     return cleaned.strip()
 
+
 def translate_to_english(user_input, user_language, model_id):
-    cursor = get_safe_cursor()
-    prompt = f"You are a professional translator. Translate the following text into English, keeping meaning intact. Original language: {user_language}. Return only the translation without explanations or markdown."
-    text = f"{prompt}\n\n{user_input.strip()}".replace("'", "\\'")
-    sql = f"SELECT sys.ML_GENERATE('{text}', JSON_OBJECT('task','generation','model_id','{model_id}','language','en','max_tokens',4000)) AS response;"
-    cursor.execute(sql)
-    return extract_clean_sql(cursor.fetchall()[0][0])
+    cursor, conn = get_safe_cursor()
+    try:
+        prompt = f"You are a professional translator. Translate the following text into English, keeping meaning intact. Original language: {user_language}. Return only the translation without explanations or markdown."
+        text = f"{prompt}\n\n{user_input.strip()}".replace("'", "\\'")
+        sql = f"SELECT sys.ML_GENERATE('{text}', JSON_OBJECT('task','generation','model_id','{model_id}','language','en','max_tokens',4000)) AS response;"
+        cursor.execute(sql)
+        return extract_clean_sql(cursor.fetchall()[0][0])
+    finally:
+        cursor.close()
+        conn.close()
+
 
 def call_ml_generate(question_text, user_language, model_id):
-    cursor = get_safe_cursor()
     if user_language.lower() != 'en':
         question_text = translate_to_english(question_text, user_language, model_id)
     prompt = f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. Return only the SQL without markdown."
     escaped = f"{prompt}\n\n{question_text}".replace("'", "\\'")
-    schema_q = f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' ORDER BY TABLE_NAME, ORDINAL_POSITION;"
+    schema_q = (
+        f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY "
+        f"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' "
+        "ORDER BY TABLE_NAME, ORDINAL_POSITION;"
+    )
     df_schema = execute_sql(schema_q)
-    context = '\\n'.join(f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}" for _, row in df_schema.iterrows()).replace("'", "\\'")
-    sql = f"SELECT sys.ML_GENERATE('{escaped}', JSON_OBJECT('task','generation','model_id','{model_id}','language','en','context','{context}','max_tokens',4000)) AS response;"
-    cursor.execute(sql)
-    return cursor.fetchall()[0][0]
+    context = '\n'.join(
+        f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}"
+        for _, row in df_schema.iterrows()
+    ).replace("'", "\\'")
+    cursor, conn = get_safe_cursor()
+    try:
+        sql = (
+            f"SELECT sys.ML_GENERATE('{escaped}', "
+            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','en','context','{context}','max_tokens',4000)) "
+            "AS response;"
+        )
+        cursor.execute(sql)
+        return cursor.fetchall()[0][0]
+    finally:
+        cursor.close()
+        conn.close()
+
 
 def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_attempts=3):
-    cursor = get_db_connection().cursor()
     restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE)\b", re.IGNORECASE)
     current = raw_sql_resp
     for _ in range(max_attempts):
         sql_query = extract_clean_sql(current)
         if restricted.search(sql_query):
             return f"❌ Restricted operation: {sql_query}", sql_query
+        cursor, conn = get_safe_cursor()
         try:
             cursor.execute(sql_query)
             dfs = []
@@ -127,20 +157,32 @@ def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_a
         except mysql.connector.Error as err:
             repair_prompt = (
                 f"Original intent:\n{original_intent}\n"
-                f"SQL query error:\n{sql_query}\n"
-                f"Error: {err}\n"
+                f"SQL query error:\n{sql_query}\nError: {err}\n"
                 "Please regenerate a corrected SELECT-only query."
             )
             current = call_ml_generate(repair_prompt, 'en', model_id)
+        finally:
+            cursor.close()
+            conn.close()
     return "❌ Failed to produce valid SQL after retries.", ""
 
+
 def generate_natural_language_answer(user_question, final_df, user_language, model_id):
-    cursor = get_safe_cursor()
-    text_context = final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df)
-    prompt = f"Respond to: {user_question}\nUsing context:\n{text_context}".replace("'", "\\'")
-    sql = f"SELECT sys.ML_GENERATE('{prompt}', JSON_OBJECT('task','generation','model_id','{model_id}','language','{user_language}','max_tokens',4000)) AS response;"
-    cursor.execute(sql)
-    return extract_clean_sql(cursor.fetchall()[0][0])
+    cursor, conn = get_safe_cursor()
+    try:
+        text_context = final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df)
+        prompt = f"Respond to: {user_question}\nUsing context:\n{text_context}".replace("'", "\\'")
+        sql = (
+            f"SELECT sys.ML_GENERATE('{prompt}', "
+            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','{user_language}','max_tokens',4000)) "
+            "AS response;"
+        )
+        cursor.execute(sql)
+        return extract_clean_sql(cursor.fetchall()[0][0])
+    finally:
+        cursor.close()
+        conn.close()
+
 
 def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
     raw_resp = call_ml_generate(user_question, user_language, model_id)
@@ -153,34 +195,16 @@ def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
         return answer, generated_sql
     return final_result, generated_sql
 
+
 def add_footer():
     st.markdown(
         """
         <style>
-        /* Push the chat-input bar up so we have space for the footer */
-        [data-testid="stChatInput"] {
-            bottom: 60px !important;
-        }
-
-        /* The actual footer */
-        #fixed-footer {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            width: 100%;
-            background: #f9f9f9;
-            padding: 10px;
-            font-size: 12px;
-            color: gray;
-            text-align: center;
-            border-top: 1px solid #e0e0e0;
-            z-index: 10000;
-        }
+        [data-testid="stChatInput"] { bottom: 90px !important; }
+        #fixed-footer { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; padding: 10px; font-size: 16px; color: gray; text-align: center; z-index: 10000; }
         </style>
-
         <div id="fixed-footer">
-            This chatbot can make mistakes; none of the models use this data for training.
+            This interface is for demonstrative purposes only. This is not a tool supported by Oracle.
         </div>
         """,
         unsafe_allow_html=True
@@ -188,7 +212,7 @@ def add_footer():
 
 # --- Streamlit App UI ---
 def main():
-    st.title("Natural Language → SQL Chatbot") # title can be modified
+    st.title("Natural Language → SQL Chatbot")
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
@@ -223,7 +247,6 @@ def main():
                     st.sidebar.code(generated_sql, language='sql')
         st.session_state.messages.append({"role": "assistant", "content": display_output})
 
-    #fixed footer text
     add_footer()
 
 if __name__ == "__main__":
