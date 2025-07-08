@@ -5,12 +5,12 @@ import pandas as pd
 import json
 
 # --- Configuration ---
-DB_HOST = "10.0.1.54"
-DB_PORT = 3306
-DB_USER = "admin"
-DB_PASSWORD = "@Mysqlse2025"
-DB_NAME = "airportdb"
-DBSYSTEM_SCHEMA = DB_NAME
+DB_HOST = "10.0.1.54" # Database Host, Auto-populated variable
+DB_PORT = 3306 # Database port, Auto-populated variable
+DB_USER = "admin" # Database user, Auto-populated variable
+DB_PASSWORD = "@Mysqlse2025" # Database user password, Auto-populated variable
+DB_NAME = "airportdb" # Target schema, Auto-populated variable
+DBSYSTEM_SCHEMA = DB_NAME 
 
 default_model = "meta.llama-3.1-405b-instruct"
 MODEL_OPTIONS = [
