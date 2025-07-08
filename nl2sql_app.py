@@ -8,14 +8,16 @@ import json
 # Configuration
 # -----------------------------------------------------------------------------
 
-DB_HOST = "10.0.1.54"  # Database Host
-DB_PORT = 3306         # Database port
-DB_USER = "admin"     # Database user
+DB_HOST = "10.0.1.54"   # Database Host
+DB_PORT = 3306          # Database port
+DB_USER = "admin"       # Database user
 DB_PASSWORD = "@Mysqlse2025"  # Database password
-DB_NAME = "airportdb" # Target schema
+DB_NAME = "airportdb"   # Default target schema
 DBSYSTEM_SCHEMA = DB_NAME
 
-# Model Configuration ---------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
 
 default_model = "meta.llama-3.1-405b-instruct"
 MODEL_OPTIONS = [
@@ -41,9 +43,7 @@ restricted_models = [
 # -----------------------------------------------------------------------------
 
 def get_db_connection():
-    """
-    Open a brand-new connection on each call (drop cached connection to allow concurrency).
-    """
+    """Open a brand-new connection on each call (drop cached connection to allow concurrency)."""
     return mysql.connector.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -54,14 +54,10 @@ def get_db_connection():
         use_pure=True
     )
 
-
 def get_safe_cursor():
-    """
-    Return a fresh cursor and its connection for each query.
-    """
+    """Return a fresh cursor and its connection for each query."""
     conn = get_db_connection()
     return conn.cursor(), conn
-
 
 def execute_sql(sql: str) -> pd.DataFrame:
     """
@@ -82,7 +78,8 @@ def execute_sql(sql: str) -> pd.DataFrame:
 # LLM / text helpers
 # -----------------------------------------------------------------------------
 
-def extract_clean_sql(raw_response):
+def extract_clean_sql(raw_response: str) -> str:
+    """Clean up the raw LLM response to extract pure SQL."""
     if raw_response.startswith("'") and raw_response.endswith("'"):
         raw_response = raw_response[1:-1]
     try:
@@ -98,25 +95,40 @@ def extract_clean_sql(raw_response):
             cleaned = cleaned[:-3]
     return cleaned.strip()
 
-
-def translate_to_english(user_input, user_language, model_id):
+def translate_to_english(user_input: str, user_language: str, model_id: str) -> str:
+    """Use the ML model to translate text into English."""
     cursor, conn = get_safe_cursor()
     try:
-        prompt = f"You are a professional translator. Translate the following text into English, keeping meaning intact. Original language: {user_language}. Return only the translation without explanations or markdown."
+        prompt = (
+            f"You are a professional translator. Translate the following text into English, "
+            f"keeping meaning intact. Original language: {user_language}. "
+            "Return only the translation without explanations or markdown."
+        )
         text = f"{prompt}\n\n{user_input.strip()}".replace("'", "\\'")
-        sql = f"SELECT sys.ML_GENERATE('{text}', JSON_OBJECT('task','generation','model_id','{model_id}','language','en','max_tokens',4000)) AS response;"
+        sql = (
+            f"SELECT sys.ML_GENERATE('{text}', "
+            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','en','max_tokens',4000)) "
+            "AS response;"
+        )
         cursor.execute(sql)
         return extract_clean_sql(cursor.fetchall()[0][0])
     finally:
         cursor.close()
         conn.close()
 
-
-def call_ml_generate(question_text, user_language, model_id):
+def call_ml_generate(question_text: str, user_language: str, model_id: str) -> str:
+    """Ask the ML model to generate a SQL query based on natural language."""
     if user_language.lower() != 'en':
         question_text = translate_to_english(question_text, user_language, model_id)
-    prompt = f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. Return only the SQL without markdown."
+
+    # Build prompt
+    prompt = (
+        f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. "
+        "Return only the SQL without markdown."
+    )
     escaped = f"{prompt}\n\n{question_text}".replace("'", "\\'")
+
+    # Gather schema context
     schema_q = (
         f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY "
         f"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' "
@@ -124,15 +136,18 @@ def call_ml_generate(question_text, user_language, model_id):
     )
     df_schema = execute_sql(schema_q)
     context = '\n'.join(
-        f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}"
+        f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, "
+        f"Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}"
         for _, row in df_schema.iterrows()
     ).replace("'", "\\'")
+
+    # Call the model
     cursor, conn = get_safe_cursor()
     try:
         sql = (
             f"SELECT sys.ML_GENERATE('{escaped}', "
-            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','en','context','{context}','max_tokens',4000)) "
-            "AS response;"
+            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','en',"
+            f"'context','{context}','max_tokens',4000)) AS response;"
         )
         cursor.execute(sql)
         return cursor.fetchall()[0][0]
@@ -140,14 +155,24 @@ def call_ml_generate(question_text, user_language, model_id):
         cursor.close()
         conn.close()
 
-
-def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_attempts=3):
+def run_generated_sql_with_repair(
+    raw_sql_resp: str,
+    original_intent: str,
+    model_id: str,
+    max_attempts: int = 3
+):
+    """
+    Execute the generated SQL, retrying and repairing on errors,
+    disallowing destructive commands.
+    """
     restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE)\b", re.IGNORECASE)
     current = raw_sql_resp
+
     for _ in range(max_attempts):
         sql_query = extract_clean_sql(current)
         if restricted.search(sql_query):
             return f"❌ Restricted operation: {sql_query}", sql_query
+
         cursor, conn = get_safe_cursor()
         try:
             cursor.execute(sql_query)
@@ -161,12 +186,15 @@ def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_a
                     pass
                 if not cursor.nextset():
                     break
+
             if not dfs:
                 return f"✅ Executed (no result): {sql_query}", sql_query
             if len(dfs) == 1:
                 return dfs[0], sql_query
             return pd.concat(dfs, ignore_index=True), sql_query
+
         except mysql.connector.Error as err:
+            # Repair on error
             repair_prompt = (
                 f"Original intent:\n{original_intent}\n"
                 f"SQL query error:\n{sql_query}\nError: {err}\n"
@@ -176,14 +204,22 @@ def run_generated_sql_with_repair(raw_sql_resp, original_intent, model_id, max_a
         finally:
             cursor.close()
             conn.close()
+
     return "❌ Failed to produce valid SQL after retries.", ""
 
-
-def generate_natural_language_answer(user_question, final_df, user_language, model_id):
+def generate_natural_language_answer(
+    user_question: str,
+    final_df,
+    user_language: str,
+    model_id: str
+) -> str:
+    """Turn a small result set into a natural-language answer."""
     cursor, conn = get_safe_cursor()
     try:
         text_context = final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df)
-        prompt = f"Respond to: {user_question}\nUsing context:\n{text_context}".replace("'", "\\'")
+        prompt = (
+            f"Respond to: {user_question}\nUsing context:\n{text_context}"
+        ).replace("'", "\\'")
         sql = (
             f"SELECT sys.ML_GENERATE('{prompt}', "
             f"JSON_OBJECT('task','generation','model_id','{model_id}','language','{user_language}','max_tokens',4000)) "
@@ -195,21 +231,19 @@ def generate_natural_language_answer(user_question, final_df, user_language, mod
         cursor.close()
         conn.close()
 
-
 def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
+    """Run the end-to-end flow: generate SQL, execute (with repair), optionally NL."""
     raw_resp = call_ml_generate(user_question, user_language, model_id)
     final_result, generated_sql = run_generated_sql_with_repair(raw_resp, user_question, model_id)
     n = len(final_result) if isinstance(final_result, pd.DataFrame) else 0
+
     if model_id in restricted_models:
         use_nl = False
     if use_nl and n <= max_nl_lines:
         answer = generate_natural_language_answer(user_question, final_result, user_language, model_id)
         return answer, generated_sql
-    return final_result, generated_sql
 
-# -----------------------------------------------------------------------------
-# UI style
-# -----------------------------------------------------------------------------
+    return final_result, generated_sql
 
 def add_footer():
     st.markdown(
@@ -237,11 +271,28 @@ def add_footer():
 # -----------------------------------------------------------------------------
 
 def main():
+    global DB_NAME, DBSYSTEM_SCHEMA
+
     st.title("Natural Language → SQL Chatbot")
+
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
     with st.sidebar:
+        # Schema selection menu (above model list)
+        try:
+            schemas_df = execute_sql("SHOW SCHEMAS;")
+            schema_list = schemas_df[schemas_df.columns[0]].tolist()
+        except Exception:
+            schema_list = []
+        selected_schema = st.selectbox(
+            "Select database schema:", schema_list,
+            index=schema_list.index(DB_NAME) if DB_NAME in schema_list else 0
+        )
+        DB_NAME = selected_schema
+        DBSYSTEM_SCHEMA = selected_schema
+
+        # Model controls
         model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=MODEL_OPTIONS.index(default_model))
         nl_disabled = model_id in restricted_models
         use_nl = st.checkbox("Natural Language Response", value=not nl_disabled, disabled=nl_disabled)
@@ -249,10 +300,12 @@ def main():
         language = st.selectbox("Language:", ["en", "es", "pt", "fr"], index=0)
         show_sql = st.radio("Show generated SQL?", ["No", "Yes"], index=0)
 
+    # Display past chat messages
     for msg in st.session_state.messages:
         with st.chat_message(msg['role']):
             st.markdown(msg['content'])
 
+    # Handle new user prompt
     if prompt := st.chat_input("Ask your question..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
