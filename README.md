@@ -1,5 +1,5 @@
-![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 # NL2SQL
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
 This repository contains a minimal Streamlit application for querying an Oracle HeatWave instance using natural language. The app relies on a large language model (LLM) to translate user prompts into SQL queries.
 
