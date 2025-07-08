@@ -257,3 +257,8 @@ SHOW FULL COLUMNS FROM employees;
 
 You should now see your comments listed.
 
+---
+
+## LICENSE
+
+
