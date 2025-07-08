@@ -4,13 +4,18 @@ import mysql.connector
 import pandas as pd
 import json
 
-# --- Configuration ---
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
 DB_HOST = "10.0.1.54"  # Database Host
 DB_PORT = 3306         # Database port
 DB_USER = "admin"     # Database user
 DB_PASSWORD = "@Mysqlse2025"  # Database password
 DB_NAME = "airportdb" # Target schema
 DBSYSTEM_SCHEMA = DB_NAME
+
+# Model Configuration ---------------------------------------------------------
 
 default_model = "meta.llama-3.1-405b-instruct"
 MODEL_OPTIONS = [
@@ -30,6 +35,10 @@ restricted_models = [
     "llama3.2-3b-instruct-v1",
     "mistral-7b-instruct-v3"
 ]
+
+# -----------------------------------------------------------------------------
+# DB helpers – each call opens/closes its own connection for concurrency
+# -----------------------------------------------------------------------------
 
 def get_db_connection():
     """
@@ -69,6 +78,9 @@ def execute_sql(sql: str) -> pd.DataFrame:
         cursor.close()
         conn.close()
 
+# -----------------------------------------------------------------------------
+# LLM / text helpers
+# -----------------------------------------------------------------------------
 
 def extract_clean_sql(raw_response):
     if raw_response.startswith("'") and raw_response.endswith("'"):
@@ -195,12 +207,22 @@ def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
         return answer, generated_sql
     return final_result, generated_sql
 
+# -----------------------------------------------------------------------------
+# UI style
+# -----------------------------------------------------------------------------
 
 def add_footer():
     st.markdown(
         """
         <style>
-        [data-testid="stChatInput"] { bottom: 90px !important; }
+        /* Default (desktop) */
+          [data-testid='stChatInput'] { bottom: 50px !important; }
+
+          /* Mobile: width less than 768px */
+          @media (max-width: 767px) {
+            [data-testid='stChatInput'] { bottom: 90px !important; }
+          }
+
         #fixed-footer { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; padding: 10px; font-size: 16px; color: gray; text-align: center; z-index: 10000; }
         </style>
         <div id="fixed-footer">
@@ -210,7 +232,10 @@ def add_footer():
         unsafe_allow_html=True
     )
 
-# --- Streamlit App UI ---
+# -----------------------------------------------------------------------------
+# Streamlit App UI
+# -----------------------------------------------------------------------------
+
 def main():
     st.title("Natural Language → SQL Chatbot")
     if 'messages' not in st.session_state:
