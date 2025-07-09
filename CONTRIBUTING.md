@@ -49,7 +49,6 @@ can be accepted.
 ## Code of conduct
 
 Follow the [Golden Rule](https://en.wikipedia.org/wiki/Golden_Rule). If you'd
-like more specific guidelines, see the [Contributor Covenant Code of Conduct][COC].
+like more specific guidelines, see the [Code of Conduct](/CODE_OF_CONDUCT.md).
 
 [OCA]: https://oca.opensource.oracle.com
-[COC]: https://www.contributor-covenant.org/version/1/4/code-of-conduct/
