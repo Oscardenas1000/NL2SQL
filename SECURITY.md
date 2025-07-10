@@ -6,25 +6,12 @@ If you discover a security vulnerability in this project, please let us know **p
 
 You can report issues via one of these two channels:
 
-1. **GitHub**: Open a private security issue  
-   <https://github.com/YourOrg/YourRepo/issues/new?labels=security&template=security.md>  
-2. **Email**: Send to our security team at <security@your-project.org>
+1. **GitHub**: Open a private security [issue](https://github.com/Oscardenas1000/NL2SQL/issues)
 
 Please include as much information as you can, such as:
 - A description of the vulnerability  
 - Steps to reproduce (ideally with proof-of-concept code)  
 - The impact or scope of the issue  
-
----
-
-## Supported Versions
-
-We currently provide security fixes for:
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
-| < 1.0.0 | :x:                 |
 
 ---
 
