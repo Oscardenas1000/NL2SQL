@@ -92,9 +92,9 @@ def call_ml_generate(question_text, user_language, model_id):
         question_text = translate_to_english(question_text, user_language, model_id)
     prompt = f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. Return only the SQL without markdown."
     escaped = f"{prompt}\n\n{question_text}".replace("'", "\\'")
-    schema_q = f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' ORDER BY TABLE_NAME, ORDINAL_POSITION;"
+    schema_q = f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' ORDER BY TABLE_NAME, ORDINAL_POSITION;"
     df_schema = execute_sql(schema_q)
-    context = '\\n'.join(f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}" for _, row in df_schema.iterrows()).replace("'", "\\'")
+    context = '\\n'.join(f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}, Context: {row.COLUMN_COMMENT}" for _, row in df_schema.iterrows()).replace("'", "\\'")
     sql = f"SELECT sys.ML_GENERATE('{escaped}', JSON_OBJECT('task','generation','model_id','{model_id}','language','en','context','{context}','max_tokens',4000)) AS response;"
     cursor.execute(sql)
     return cursor.fetchall()[0][0]
