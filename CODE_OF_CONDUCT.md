@@ -58,8 +58,7 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the project maintainers by opening a **private issue** on GitHub:
-https://github.com/YourOrg/YourRepo/issues/new?assignees=&labels=security&template=security.md
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the project maintainers by opening a [**private issue**](https://github.com/Oscardenas1000/NL2SQL/issues) on GitHub.
 
 All complaints will be reviewed and investigated promptly and fairly.
 
