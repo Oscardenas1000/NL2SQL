@@ -130,14 +130,14 @@ def call_ml_generate(question_text: str, user_language: str, model_id: str) -> s
 
     # Gather schema context
     schema_q = (
-        f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY "
+        f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_COMMENT "
         f"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' "
         "ORDER BY TABLE_NAME, ORDINAL_POSITION;"
     )
     df_schema = execute_sql(schema_q)
     context = '\n'.join(
         f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, "
-        f"Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}"
+        f"Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}, Context: {row.COLUMN_COMMENT}"
         for _, row in df_schema.iterrows()
     ).replace("'", "\\'")
 
