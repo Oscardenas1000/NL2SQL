@@ -124,6 +124,7 @@ def call_ml_generate(question_text: str, user_language: str, model_id: str) -> s
     # Build prompt
     prompt = (
         f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. "
+        "Use ONLY unqualified table names (no schema prefixes). "
         "Return only the SQL without markdown."
     )
     escaped = f"{prompt}\n\n{question_text}".replace("'", "\\'")
@@ -165,7 +166,7 @@ def run_generated_sql_with_repair(
     Execute the generated SQL, retrying and repairing on errors,
     disallowing destructive commands.
     """
-    restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE)\b", re.IGNORECASE)
+    restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|SHOW)\b", re.IGNORECASE)
     current = raw_sql_resp
 
     for _ in range(max_attempts):
@@ -231,16 +232,22 @@ def generate_natural_language_answer(
         cursor.close()
         conn.close()
 
-def full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines):
-    """Run the end-to-end flow: generate SQL, execute (with repair), optionally NL."""
+def full_pipeline(user_question, user_language, model_id,
+                  use_nl, max_nl_lines, override_nl=False):              
     raw_resp = call_ml_generate(user_question, user_language, model_id)
-    final_result, generated_sql = run_generated_sql_with_repair(raw_resp, user_question, model_id)
+    final_result, generated_sql = run_generated_sql_with_repair(
+        raw_resp, user_question, model_id
+    )
+
+    if (model_id in restricted_models) and (not override_nl):
+        use_nl = False
+
     n = len(final_result) if isinstance(final_result, pd.DataFrame) else 0
 
-    if model_id in restricted_models:
-        use_nl = False
     if use_nl and n <= max_nl_lines:
-        answer = generate_natural_language_answer(user_question, final_result, user_language, model_id)
+        answer = generate_natural_language_answer(
+            user_question, final_result, user_language, model_id
+        )
         return answer, generated_sql
 
     return final_result, generated_sql
@@ -340,7 +347,7 @@ def main():
 
         with st.chat_message("assistant"):
             with st.spinner("Running query..."):
-                output, generated_sql = full_pipeline(prompt, language, model_id, use_nl, max_nl)
+                output, generated_sql = full_pipeline(prompt, language, model_id, use_nl, max_nl, override_nl)
                 if isinstance(output, pd.DataFrame):
                     st.dataframe(output)
                     display_output = "✅ Returned a data table."
