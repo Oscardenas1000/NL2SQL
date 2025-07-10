@@ -294,9 +294,36 @@ def main():
 
         # Model controls
         model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=MODEL_OPTIONS.index(default_model))
+        
+        # 1) detect the restricted models as before
         nl_disabled = model_id in restricted_models
-        use_nl = st.checkbox("Natural Language Response", value=not nl_disabled, disabled=nl_disabled)
-        max_nl = st.number_input("NL Response Threshold:", min_value=1, value=24, disabled=not use_nl)
+
+        # 2) offer an override checkbox that’s only visible when the model is restricted
+        override_nl = False
+        if nl_disabled:
+            override_nl = st.checkbox(
+                "⚠️ Force‐enable NL even on restricted model", 
+                value=False,
+                help="Only use if you know what you’re doing"
+            )
+
+        # 3) compute whether the NL toggle should actually be disabled
+        effective_disabled = nl_disabled and not override_nl
+
+        # 4) the main NL checkbox uses that
+        use_nl = st.checkbox(
+            "Natural Language Response",
+            value=not nl_disabled or override_nl,
+            disabled=effective_disabled
+        )
+
+        # 5) threshold only enabled when use_nl is true
+        max_nl = st.number_input(
+            "NL Response Threshold:", 
+            min_value=1, 
+            value=24, 
+            disabled=not use_nl
+        )
         language = st.selectbox("Language:", ["en", "es", "pt", "fr"], index=0)
         show_sql = st.radio("Show generated SQL?", ["No", "Yes"], index=0)
 
