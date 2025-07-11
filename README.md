@@ -260,6 +260,46 @@ You should now see your comments listed.
 
 ---
 
+## How the App works:
+The flowchart below outlines the full workflow of how natural language queries (in any language) are processed and transformed into SQL queries to retrieve data from a database.
+<img src="resources/diagram.svg" alt="App Flow Diagram" width="100%"/>
+
+### Step-by-Step Explanation
+
+1. **Input in Natural Language (NL)**
+   The user submits a question in natural language, possibly in any language, such as:
+   `¿Cuáles son los productos más vendidos?`
+
+2. **Retrieve Schema Information**
+   The system first executes:
+   ```sql
+   SELECT * FROM information_schema.tables
+   ```
+   to discover all available tables in the database. This ensures the system knows which data sources it can query.
+
+3. **Check Input Language**
+   The system determines if the query is already in English:
+   - If yes → Proceeds to generate SQL.
+   - If not → Translates it into English using a translation engine.
+
+4. **Generate SQL Code**
+   Based on the now-English input and known schema, the app generates a raw SQL query matching the user's intent.
+
+5. **Clean Up SQL Code**
+   The raw SQL is cleaned or adjusted to:
+   - Fix structural issues.
+   - Improve compatibility with the actual database schema.
+
+6. **Execute the SQL Code**
+   The cleaned SQL query is run against the database.
+
+7. **Check Execution Result:**
+   - If the query fails (due to auto-generated syntax or schema issues):  
+     The procedure tries to self-correct the query for multiple times.
+   - If the query succeeds:
+     - If the result has fewer than 24 rows, it is translated back into natural language and returned to the user in sentence form.
+     - If the result has 24 rows or more, it is shown as a tabular output.
+
 ## LICENSE
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
