@@ -260,6 +260,9 @@ You should now see your comments listed.
 
 ---
 
+## How the App works:
+<img src="resources/diagram.svg" alt="App Flow Diagram" width="100%"/>
+
 ## LICENSE
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
