@@ -14,7 +14,7 @@ DB_USER = "admin"       # Database user
 DB_PASSWORD = "@Mysqlse2025"  # Database password
 DB_NAME = "airportdb"   # Default target schema
 DBSYSTEM_SCHEMA = DB_NAME
-
+HISTORY_SCHEMA = "history"
 # -----------------------------------------------------------------------------
 # Model Configuration
 # -----------------------------------------------------------------------------
@@ -37,6 +37,61 @@ restricted_models = [
     "llama3.2-3b-instruct-v1",
     "mistral-7b-instruct-v3"
 ]
+
+# -----------------------------------------------------------------------------
+# History Functions
+# -----------------------------------------------------------------------------
+
+def insert_into_history(question, query):
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=HISTORY_SCHEMA
+        )
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO history (question, query) VALUES (%s, %s)", (question, query))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as err:
+        st.error(f"[History] Insert error: {err}")
+
+def fetch_history():
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=HISTORY_SCHEMA
+        )
+        df = pd.read_sql("SELECT question FROM history ORDER BY id DESC LIMIT 20", conn)
+        conn.close()
+        return df
+    except mysql.connector.Error as err:
+        st.error(f"[History] Fetch error: {err}")
+        return pd.DataFrame()
+
+def clear_history():
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=HISTORY_SCHEMA
+        )
+        cursor = conn.cursor()
+        cursor.execute("TRUNCATE TABLE history")
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as err:
+        st.error(f"[History] Clear error: {err}")
+
 
 # -----------------------------------------------------------------------------
 # DB helpers – each call opens/closes its own connection for concurrency
@@ -124,7 +179,7 @@ def call_ml_generate(question_text: str, user_language: str, model_id: str) -> s
     # Build prompt
     prompt = (
         f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. "
-        "Use ONLY unqualified table names (no schema prefixes). "
+	"Use ONLY unqualified table names (no schema prefixes). "
         "Return only the SQL without markdown."
     )
     escaped = f"{prompt}\n\n{question_text}".replace("'", "\\'")
@@ -166,7 +221,7 @@ def run_generated_sql_with_repair(
     Execute the generated SQL, retrying and repairing on errors,
     disallowing destructive commands.
     """
-    restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|SHOW)\b", re.IGNORECASE)
+    restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE)\b", re.IGNORECASE)
     current = raw_sql_resp
 
     for _ in range(max_attempts):
@@ -278,12 +333,18 @@ def add_footer():
 # -----------------------------------------------------------------------------
 
 def main():
+    #st.image("rnum.png", width=400)
+    #st.title("RNUM Network Analyzer powered by HeatWave GenAI Bot")
     global DB_NAME, DBSYSTEM_SCHEMA
 
     st.title("Natural Language → SQL Chatbot")
 
     if 'messages' not in st.session_state:
         st.session_state.messages = []
+
+    # 1) init history_list from DB on first run
+    if 'history_list' not in st.session_state:
+        st.session_state.history_list = fetch_history()['question'].tolist()
 
     with st.sidebar:
         # Schema selection menu (above model list)
@@ -301,7 +362,7 @@ def main():
 
         # Model controls
         model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=MODEL_OPTIONS.index(default_model))
-        
+
         # 1) detect the restricted models as before
         nl_disabled = model_id in restricted_models
 
@@ -309,7 +370,7 @@ def main():
         override_nl = False
         if nl_disabled:
             override_nl = st.checkbox(
-                "⚠️ Force‐enable NL even on restricted model", 
+                "Force-enable NL even on restricted model", 
                 value=False,
                 help="Only use if you know what you’re doing"
             )
@@ -334,6 +395,26 @@ def main():
         language = st.selectbox("Language:", ["en", "es", "pt", "fr"], index=0)
         show_sql = st.radio("Show generated SQL?", ["No", "Yes"], index=0)
 
+        # 6) HISTORY
+        st.markdown("---")
+        st.subheader("History")
+
+        history_df = fetch_history()   # now re-runs on every button click
+
+        if not history_df.empty:
+            for _, row in history_df.iterrows():
+                st.markdown(f"- {row['question']}")
+        else:
+            st.info("No history yet.")
+
+        # refresh button
+        if st.button("🔄 Refresh History"):
+            pass  # no-op; clicking it causes a rerun
+
+        if st.button("🗑️ Clear History"):
+            clear_history()
+            st.rerun()
+
     # Display past chat messages
     for msg in st.session_state.messages:
         with st.chat_message(msg['role']):
@@ -357,6 +438,11 @@ def main():
                 if show_sql == "Yes" and generated_sql:
                     st.sidebar.markdown("### Generated SQL")
                     st.sidebar.code(generated_sql, language='sql')
+                # save to history
+                insert_into_history(prompt, generated_sql or "")
+
+                # 3) immediately reflect it in the sidebar
+                st.session_state.history_list.insert(0, prompt)
         st.session_state.messages.append({"role": "assistant", "content": display_output})
 
     add_footer()
