@@ -6,3 +6,4 @@ numpy
 matplotlib
 seaborn
 setuptools
+langchain-core
