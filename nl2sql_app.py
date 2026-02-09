@@ -1,5 +1,4 @@
 import streamlit as st
-import re
 import mysql.connector
 import pandas as pd
 import json
@@ -108,135 +107,84 @@ def execute_sql(sql: str) -> pd.DataFrame:
 # LLM / text helpers
 # -----------------------------------------------------------------------------
 
-def extract_clean_sql(raw_response: str) -> str:
-    """Clean up the raw LLM response to extract pure SQL."""
-    if raw_response.startswith("'") and raw_response.endswith("'"):
-        raw_response = raw_response[1:-1]
-    try:
-        parsed = json.loads(raw_response)
-        text = parsed.get("text", "")
-    except json.JSONDecodeError:
-        text = raw_response
-    cleaned = text.replace('\\n', '\n').replace('\\', '').replace('\\"', '"').strip()
-    for fence in ('```sql', '```'):
-        if cleaned.startswith(fence):
-            cleaned = cleaned[len(fence):]
-        if cleaned.endswith('```'):
-            cleaned = cleaned[:-3]
-    return cleaned.strip()
-
-def translate_to_english(user_input: str, user_language: str, model_id: str) -> str:
-    """Use the ML model to translate text into English."""
+def run_nl_sql(natural_language_statement: str, model_id: str):
+    """
+    Execute NL_SQL and return:
+    1) the final query result as DataFrame (or message string on failure/no rows)
+    2) the generated SQL extracted from the verbose NL_SQL info stream.
+    """
     cursor, conn = get_safe_cursor()
+    generated_sql = ""
+    result_frames = []
+
     try:
-        prompt = (
-            f"You are a professional translator. Translate the following text into English, "
-            f"keeping meaning intact. Original language: {user_language}. "
-            "Return only the translation without explanations or markdown."
+        cursor.execute(
+            (
+                "CALL sys.NL_SQL("
+                "%s, "
+                "@output, "
+                "JSON_OBJECT("
+                "'schemas', JSON_ARRAY(%s), "
+                "'verbose', 1, "
+                "'model_id', %s"
+                ")"
+                ");"
+            ),
+            (natural_language_statement, DBSYSTEM_SCHEMA, model_id)
         )
-        text = f"{prompt}\n\n{user_input.strip()}".replace("'", "\\'")
-        sql = (
-            f"SELECT sys.ML_GENERATE('{text}', "
-            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','en','max_tokens',4000)) "
-            "AS response;"
-        )
-        cursor.execute(sql)
-        return extract_clean_sql(cursor.fetchall()[0][0])
+
+        while True:
+            if cursor.with_rows:
+                rows = cursor.fetchall()
+                cols = list(cursor.column_names)
+
+                if rows and cols == ["nl_sql_info"]:
+                    for row in rows:
+                        try:
+                            info = json.loads(row[0])
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if info.get("stage") == "validated_sql":
+                            message = str(info.get("message", ""))
+                            marker = "Generated SQL statement:"
+                            if marker in message:
+                                generated_sql = message.split(marker, 1)[1].strip()
+                elif rows:
+                    result_frames.append(pd.DataFrame(rows, columns=cols))
+
+            if not cursor.nextset():
+                break
+
+        if not generated_sql:
+            cursor.execute("SELECT @output AS nl_sql_output;")
+            output_rows = cursor.fetchall()
+            if output_rows:
+                output_value = output_rows[0][0]
+                if isinstance(output_value, str):
+                    try:
+                        output_json = json.loads(output_value)
+                        generated_sql = str(
+                            output_json.get("generated_sql")
+                            or output_json.get("validated_sql")
+                            or output_json.get("sql")
+                            or ""
+                        ).strip()
+                    except json.JSONDecodeError:
+                        generated_sql = output_value.strip()
+
+        if not result_frames:
+            return "✅ Query executed with no tabular result.", generated_sql
+
+        if len(result_frames) == 1:
+            return result_frames[0], generated_sql
+
+        return pd.concat(result_frames, ignore_index=True), generated_sql
+
+    except mysql.connector.Error as err:
+        return f"❌ NL_SQL failed: {err}", generated_sql
     finally:
         cursor.close()
         conn.close()
-
-def call_ml_generate(question_text: str, user_language: str, model_id: str) -> str:
-    """Ask the ML model to generate a SQL query based on natural language."""
-    if user_language.lower() != 'en':
-        question_text = translate_to_english(question_text, user_language, model_id)
-
-    # Build prompt
-    prompt = (
-        f"You are an expert in MySQL. Convert this into a SQL query for '{DBSYSTEM_SCHEMA}'. "
-        "Use ONLY unqualified table names (no schema prefixes). "
-        "Return only the SQL without markdown."
-    )
-    escaped = f"{prompt}\n\n{question_text}".replace("'", "\\'")
-
-    # Gather schema context
-    schema_q = (
-        f"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_COMMENT "
-        f"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='{DBSYSTEM_SCHEMA}' "
-        "ORDER BY TABLE_NAME, ORDINAL_POSITION;"
-    )
-    df_schema = execute_sql(schema_q)
-    context = '\n'.join(
-        f"Table: {row.TABLE_NAME}, Column: {row.COLUMN_NAME}, Type: {row.COLUMN_TYPE}, "
-        f"Nullable: {row.IS_NULLABLE}, Key: {row.COLUMN_KEY}, Context: {row.COLUMN_COMMENT}"
-        for _, row in df_schema.iterrows()
-    ).replace("'", "\\'")
-
-    # Call the model
-    cursor, conn = get_safe_cursor()
-    try:
-        sql = (
-            f"SELECT sys.ML_GENERATE('{escaped}', "
-            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','en',"
-            f"'context','{context}','max_tokens',4000)) AS response;"
-        )
-        cursor.execute(sql)
-        return cursor.fetchall()[0][0]
-    finally:
-        cursor.close()
-        conn.close()
-
-def run_generated_sql_with_repair(
-    raw_sql_resp: str,
-    original_intent: str,
-    model_id: str,
-    max_attempts: int = 3
-):
-    """
-    Execute the generated SQL, retrying and repairing on errors,
-    disallowing destructive commands.
-    """
-    restricted = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|SHOW)\b", re.IGNORECASE)
-    current = raw_sql_resp
-
-    for _ in range(max_attempts):
-        sql_query = extract_clean_sql(current)
-        if restricted.search(sql_query):
-            return f"❌ Restricted operation: {sql_query}", sql_query
-
-        cursor, conn = get_safe_cursor()
-        try:
-            cursor.execute(sql_query)
-            dfs = []
-            while True:
-                try:
-                    rows = cursor.fetchall()
-                    cols = cursor.column_names
-                    dfs.append(pd.DataFrame(rows, columns=cols))
-                except Exception:
-                    pass
-                if not cursor.nextset():
-                    break
-
-            if not dfs:
-                return f"✅ Executed (no result): {sql_query}", sql_query
-            if len(dfs) == 1:
-                return dfs[0], sql_query
-            return pd.concat(dfs, ignore_index=True), sql_query
-
-        except mysql.connector.Error as err:
-            # Repair on error
-            repair_prompt = (
-                f"Original intent:\n{original_intent}\n"
-                f"SQL query error:\n{sql_query}\nError: {err}\n"
-                "Please regenerate a corrected SELECT-only query."
-            )
-            current = call_ml_generate(repair_prompt, 'en', model_id)
-        finally:
-            cursor.close()
-            conn.close()
-
-    return "❌ Failed to produce valid SQL after retries.", ""
 
 def generate_natural_language_answer(
     user_question: str,
@@ -257,24 +205,30 @@ def generate_natural_language_answer(
             "AS response;"
         )
         cursor.execute(sql)
-        return extract_clean_sql(cursor.fetchall()[0][0])
+        raw_response = cursor.fetchall()[0][0]
+        if not isinstance(raw_response, str):
+            return str(raw_response)
+        try:
+            parsed = json.loads(raw_response)
+            if isinstance(parsed, dict) and "text" in parsed:
+                return str(parsed["text"]).strip()
+        except json.JSONDecodeError:
+            pass
+        return raw_response.strip()
     finally:
         cursor.close()
         conn.close()
 
 def full_pipeline(user_question, user_language, model_id,
-                  use_nl, max_nl_lines, override_nl=False):              
-    raw_resp = call_ml_generate(user_question, user_language, model_id)
-    final_result, generated_sql = run_generated_sql_with_repair(
-        raw_resp, user_question, model_id
-    )
+                  use_nl, max_nl_lines, override_nl=False):
+    final_result, generated_sql = run_nl_sql(user_question, model_id)
 
     if (model_id in restricted_models) and (not override_nl):
         use_nl = False
 
     n = len(final_result) if isinstance(final_result, pd.DataFrame) else 0
 
-    if use_nl and n <= max_nl_lines:
+    if use_nl and isinstance(final_result, pd.DataFrame) and n <= max_nl_lines:
         answer = generate_natural_language_answer(
             user_question, final_result, user_language, model_id
         )
