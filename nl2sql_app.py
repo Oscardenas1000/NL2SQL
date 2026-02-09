@@ -19,24 +19,54 @@ DBSYSTEM_SCHEMA = DB_NAME
 # Model Configuration
 # -----------------------------------------------------------------------------
 
-default_model = "meta.llama-3.1-405b-instruct"
-MODEL_OPTIONS = [
-    "meta.llama-3.1-405b-instruct",
-    "meta.llama-3.2-90b-vision-instruct",
-    "meta.llama-3.3-70b-instruct",
-    "cohere.command-r-plus-08-2024",
-    "cohere.command-r-08-2024",
-    "llama3.1-8b-instruct-v1",
-    "llama3.2-1b-instruct-v1",
-    "llama3.2-3b-instruct-v1",
-    "mistral-7b-instruct-v3"
-]
-restricted_models = [
-    "llama3.1-8b-instruct-v1",
-    "llama3.2-1b-instruct-v1",
-    "llama3.2-3b-instruct-v1",
-    "mistral-7b-instruct-v3"
-]
+MODEL_CATALOG_QUERY = (
+    "SELECT * FROM sys.ML_SUPPORTED_LLMS "
+    "ORDER BY availability_date DESC;"
+)
+GENERATION_MODELS_QUERY = (
+    "SELECT * "
+    "FROM sys.ML_SUPPORTED_LLMS "
+    "WHERE JSON_CONTAINS(capabilities, '\"GENERATION\"') "
+    "ORDER BY availability_date DESC;"
+)
+
+default_model = None
+MODEL_OPTIONS = []
+restricted_models = []
+
+def refresh_model_catalog():
+    """Refresh model options and restricted models from the system catalog."""
+    global MODEL_OPTIONS, restricted_models, default_model
+    try:
+        catalog_df = execute_sql(MODEL_CATALOG_QUERY)
+        generation_df = execute_sql(GENERATION_MODELS_QUERY)
+    except Exception:
+        MODEL_OPTIONS = []
+        restricted_models = []
+        default_model = None
+        return
+
+    MODEL_OPTIONS = (
+        generation_df["model_id"].dropna().astype(str).tolist()
+        if "model_id" in generation_df.columns
+        else []
+    )
+
+    if "default_model" in generation_df.columns and "model_id" in generation_df.columns:
+        defaults = generation_df[generation_df["default_model"] == 1]["model_id"].dropna().astype(str).tolist()
+        default_model = defaults[0] if defaults else (MODEL_OPTIONS[0] if MODEL_OPTIONS else None)
+    else:
+        default_model = MODEL_OPTIONS[0] if MODEL_OPTIONS else None
+
+    if "provider" in catalog_df.columns and "model_id" in catalog_df.columns:
+        restricted_models = (
+            catalog_df[catalog_df["provider"] == "HeatWave"]["model_id"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+    else:
+        restricted_models = []
 
 # -----------------------------------------------------------------------------
 # DB helpers – each call opens/closes its own connection for concurrency
@@ -286,6 +316,11 @@ def main():
         st.session_state.messages = []
 
     with st.sidebar:
+        refresh_model_catalog()
+        if not MODEL_OPTIONS:
+            st.error("No generation-capable models found in sys.ML_SUPPORTED_LLMS.")
+            st.stop()
+
         # Schema selection menu (above model list)
         try:
             schemas_df = execute_sql("SHOW SCHEMAS;")
@@ -300,7 +335,8 @@ def main():
         DBSYSTEM_SCHEMA = selected_schema
 
         # Model controls
-        model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=MODEL_OPTIONS.index(default_model))
+        default_index = MODEL_OPTIONS.index(default_model) if default_model in MODEL_OPTIONS else 0
+        model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=default_index)
         
         # 1) detect the restricted models as before
         nl_disabled = model_id in restricted_models
