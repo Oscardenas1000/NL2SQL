@@ -19,7 +19,7 @@ except ImportError:
 # Configuration
 # -----------------------------------------------------------------------------
 
-DB_HOST = "10.0.1.54"   # Database Host
+DB_HOST = "163.192.105.216"   # Database Host
 DB_PORT = 3306          # Database port
 DB_USER = "admin"       # Database user
 DB_PASSWORD = "@Mysqlse2025"  # Database password
@@ -92,13 +92,44 @@ def get_db_connection():
         password=DB_PASSWORD,
         database=DB_NAME,
         ssl_disabled=False,
-        use_pure=True
+        use_pure=True,
+        consume_results=True
     )
 
 def get_safe_cursor():
-    """Return a fresh cursor and its connection for each query."""
+    """Return a fresh *buffered* cursor and its connection for each query."""
     conn = get_db_connection()
-    return conn.cursor(), conn
+    # buffered=True ensures result sets are fully fetched client-side, avoiding
+    # `InternalError: Unread result found` when closing cursors/connections.
+    return conn.cursor(buffered=True), conn
+
+def safe_close_cursor_conn(cursor, conn) -> None:
+    """Best-effort cleanup that avoids mysql-connector 'Unread result found' on close."""
+    # First try to consume any pending results.
+    try:
+        conn.consume_results()
+    except Exception:
+        pass
+
+    # Closing the cursor can itself raise if unread results are still present.
+    try:
+        cursor.close()
+    except mysql.connector.errors.InternalError:
+        # Try one more consume + close cycle
+        try:
+            conn.consume_results()
+        except Exception:
+            pass
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+    # Close connection last.
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 def execute_sql(sql: str) -> pd.DataFrame:
     """
@@ -112,8 +143,7 @@ def execute_sql(sql: str) -> pd.DataFrame:
         cols = cursor.column_names
         return pd.DataFrame(rows, columns=cols)
     finally:
-        cursor.close()
-        conn.close()
+        safe_close_cursor_conn(cursor, conn)
 
 # -----------------------------------------------------------------------------
 # LLM / text helpers
@@ -130,59 +160,58 @@ def run_nl_sql(natural_language_statement: str, model_id: str):
     result_frames = []
 
     try:
-        cursor.execute(
-            (
-                "CALL sys.NL_SQL("
-                "%s, "
-                "@output, "
-                "JSON_OBJECT("
-                "'schemas', JSON_ARRAY(%s), "
-                "'verbose', 1, "
-                "'model_id', %s"
-                ")"
-                ");"
-            ),
-            (natural_language_statement, DBSYSTEM_SCHEMA, model_id)
+        options = json.dumps(
+            {
+                "schemas": [DBSYSTEM_SCHEMA],
+                "verbose": 1,
+                "model_id": model_id,
+            }
         )
 
-        while True:
-            if cursor.with_rows:
-                rows = cursor.fetchall()
-                cols = list(cursor.column_names)
+        # Use callproc + stored_results instead of execute(CALL...) + nextset().
+        # With mysql-connector pure-python cursors, nextset() is not implemented,
+        # which can leave unread results and trigger InternalError on close.
+        output_vars = cursor.callproc(
+            "sys.NL_SQL",
+            (natural_language_statement, None, options),
+        )
 
-                if rows and cols == ["nl_sql_info"]:
-                    for row in rows:
-                        try:
-                            info = json.loads(row[0])
-                        except (TypeError, json.JSONDecodeError):
-                            continue
-                        if info.get("stage") == "validated_sql":
-                            message = str(info.get("message", ""))
-                            marker = "Generated SQL statement:"
-                            if marker in message:
-                                generated_sql = message.split(marker, 1)[1].strip()
-                elif rows:
-                    result_frames.append(pd.DataFrame(rows, columns=cols))
+        for stored_result in cursor.stored_results():
+            rows = stored_result.fetchall()
+            cols = list(stored_result.column_names)
 
-            if not cursor.nextset():
-                break
-
-        if not generated_sql:
-            cursor.execute("SELECT @output AS nl_sql_output;")
-            output_rows = cursor.fetchall()
-            if output_rows:
-                output_value = output_rows[0][0]
-                if isinstance(output_value, str):
+            if rows and cols == ["nl_sql_info"]:
+                for row in rows:
                     try:
-                        output_json = json.loads(output_value)
-                        generated_sql = str(
-                            output_json.get("generated_sql")
-                            or output_json.get("validated_sql")
-                            or output_json.get("sql")
-                            or ""
-                        ).strip()
-                    except json.JSONDecodeError:
-                        generated_sql = output_value.strip()
+                        info = json.loads(row[0])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if info.get("stage") == "validated_sql":
+                        message = str(info.get("message", ""))
+                        marker = "Generated SQL statement:"
+                        if marker in message:
+                            generated_sql = message.split(marker, 1)[1].strip()
+            elif rows:
+                result_frames.append(pd.DataFrame(rows, columns=cols))
+
+            try:
+                stored_result.close()
+            except Exception:
+                pass
+
+        if not generated_sql and len(output_vars) >= 2:
+            output_value = output_vars[1]
+            if isinstance(output_value, str):
+                try:
+                    output_json = json.loads(output_value)
+                    generated_sql = str(
+                        output_json.get("generated_sql")
+                        or output_json.get("validated_sql")
+                        or output_json.get("sql")
+                        or ""
+                    ).strip()
+                except json.JSONDecodeError:
+                    generated_sql = output_value.strip()
 
         if not result_frames:
             return "✅ Query executed with no tabular result.", generated_sql
@@ -195,8 +224,7 @@ def run_nl_sql(natural_language_statement: str, model_id: str):
     except mysql.connector.Error as err:
         return f"❌ NL_SQL failed: {err}", generated_sql
     finally:
-        cursor.close()
-        conn.close()
+        safe_close_cursor_conn(cursor, conn)
 
 def parse_ml_generate_response(raw_response: Any) -> str:
     """Parse ML_GENERATE output and return plain text."""
@@ -224,8 +252,7 @@ def call_ml_generate_text(prompt_text: str, model_id: str, language: str) -> str
         )
         return parse_ml_generate_response(cursor.fetchall()[0][0])
     finally:
-        cursor.close()
-        conn.close()
+        safe_close_cursor_conn(cursor, conn)
 
 def contextualize_question_with_history(
     user_question: str,
@@ -444,8 +471,7 @@ def generate_natural_language_answer(
         cursor.execute(sql)
         return parse_ml_generate_response(cursor.fetchall()[0][0])
     finally:
-        cursor.close()
-        conn.close()
+        safe_close_cursor_conn(cursor, conn)
 
 def full_pipeline(user_question, user_language, model_id,
                   use_nl, max_nl_lines, override_nl=False):
@@ -484,6 +510,24 @@ def add_footer():
         """,
         unsafe_allow_html=True
     )
+
+# -----------------------------------------------------------------------------
+# Chat rendering helpers
+# -----------------------------------------------------------------------------
+
+def render_chat_message(message: Dict[str, Any]) -> None:
+    """Render a stored chat message, including persisted table payloads."""
+    role = str(message.get("role", "assistant"))
+    with st.chat_message(role):
+        msg_type = str(message.get("type", "text"))
+        if msg_type == "table":
+            payload = message.get("payload", {})
+            if isinstance(payload, dict):
+                columns = payload.get("columns", [])
+                rows = payload.get("rows", [])
+                st.dataframe(pd.DataFrame(rows, columns=columns))
+                return
+        st.markdown(str(message.get("content", "")))
 
 # -----------------------------------------------------------------------------
 # Streamlit App UI
@@ -556,12 +600,11 @@ def main():
 
     # Display past chat messages
     for msg in st.session_state.messages:
-        with st.chat_message(msg['role']):
-            st.markdown(msg['content'])
+        render_chat_message(msg)
 
     # Handle new user prompt
     if prompt := st.chat_input("Ask your question..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -572,14 +615,25 @@ def main():
                 )
                 if isinstance(output, pd.DataFrame):
                     st.dataframe(output)
-                    display_output = "✅ Returned a data table."
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "type": "table",
+                            "content": "✅ Returned a data table.",
+                            "payload": {
+                                "columns": output.columns.tolist(),
+                                "rows": output.values.tolist(),
+                            },
+                        }
+                    )
                 else:
                     st.markdown(output)
-                    display_output = output
+                    st.session_state.messages.append(
+                        {"role": "assistant", "type": "text", "content": str(output)}
+                    )
                 if show_sql == "Yes" and generated_sql:
                     st.sidebar.markdown("### Generated SQL")
                     st.sidebar.code(generated_sql, language='sql')
-        st.session_state.messages.append({"role": "assistant", "content": display_output})
 
     add_footer()
 
