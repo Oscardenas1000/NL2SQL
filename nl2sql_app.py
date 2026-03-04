@@ -19,7 +19,7 @@ except ImportError:
 # Configuration
 # -----------------------------------------------------------------------------
 
-DB_HOST = "163.192.105.216"   # Database Host
+DB_HOST = "255.255.255.255"   # Database Host
 DB_PORT = 3306          # Database port
 DB_USER = "admin"       # Database user
 DB_PASSWORD = "@Mysqlse2025"  # Database password
