@@ -1,5 +1,3 @@
 # Local-only files and folders
-local/
-.env.local
-*.local
+
 Claude.md
