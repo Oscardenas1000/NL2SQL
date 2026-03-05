@@ -13,7 +13,7 @@ from heatwave_llm import HeatWaveLLM
 # Configuration
 # -----------------------------------------------------------------------------
 
-DEFAULT_DB_HOST = "163.192.105.216"
+DEFAULT_DB_HOST = "255.255.255.255"
 DEFAULT_DB_PORT = 3306
 DEFAULT_DB_USER = "admin"
 DB_PASSWORD = "@Mysqlse2025"
