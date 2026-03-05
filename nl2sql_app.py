@@ -1,29 +1,25 @@
-import streamlit as st
+import atexit
+import json
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
 import mysql.connector
 import pandas as pd
-import json
-import uuid
-from typing import Any, Dict, List
+import streamlit as st
 
-try:
-    from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
-    from langchain_core.messages import HumanMessage
-    from langchain_core.runnables import RunnableLambda
-    from langchain_core.runnables.history import RunnableWithMessageHistory
-    from langchain_core.tools import tool
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
+from heatwave_llm import HeatWaveLLM
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 
-DB_HOST = "163.192.105.216"   # Database Host
-DB_PORT = 3306          # Database port
-DB_USER = "admin"       # Database user
-DB_PASSWORD = "@Mysqlse2025"  # Database password
-DB_NAME = "airportdb"   # Default target schema
+DEFAULT_DB_HOST = "163.192.105.216"
+DEFAULT_DB_PORT = 3306
+DEFAULT_DB_USER = "admin"
+DB_PASSWORD = "@Mysqlse2025"
+DEFAULT_DB_NAME = "airportdb"
+
+DB_NAME = DEFAULT_DB_NAME
 DBSYSTEM_SCHEMA = DB_NAME
 
 # -----------------------------------------------------------------------------
@@ -41,16 +37,322 @@ GENERATION_MODELS_QUERY = (
     "ORDER BY availability_date DESC;"
 )
 
-default_model = None
-MODEL_OPTIONS = []
-restricted_models = []
+default_model: Optional[str] = None
+MODEL_OPTIONS: List[str] = []
+restricted_models: List[str] = []
 
-def refresh_model_catalog():
+# -----------------------------------------------------------------------------
+# Router SQL bundle (externalized schema/tables/procedures/triggers)
+# -----------------------------------------------------------------------------
+
+ROUTER_SETUP_VERSION = "v4"
+ROUTER_SETUP_STATE_KEY = f"_smart_ask_ready_{ROUTER_SETUP_VERSION}"
+ROUTER_SQL_DIR = os.path.join(os.path.dirname(__file__), "sql", "router")
+ROUTER_SQL_PLAN: List[Tuple[str, str]] = [
+    ("001_schema_tables.sql", "multi"),
+    ("005_drop_routines.sql", "multi"),
+    ("010_create_refresh_schema_hints.sql", "single"),
+    ("020_create_smart_ask.sql", "single"),
+    ("030_create_submit_router_feedback.sql", "single"),
+    ("040_create_feedback_metrics_trigger.sql", "single"),
+]
+
+# -----------------------------------------------------------------------------
+# Runtime LLM cache and cleanup
+# -----------------------------------------------------------------------------
+
+_ACTIVE_LLM_CLIENTS: List[HeatWaveLLM] = []
+
+
+def _track_llm_client(client: HeatWaveLLM) -> None:
+    if not any(existing is client for existing in _ACTIVE_LLM_CLIENTS):
+        _ACTIVE_LLM_CLIENTS.append(client)
+
+
+@atexit.register
+def _cleanup_llm_clients() -> None:
+    for client in list(_ACTIVE_LLM_CLIENTS):
+        try:
+            client.close()
+        except Exception:
+            pass
+    _ACTIVE_LLM_CLIENTS.clear()
+
+
+# -----------------------------------------------------------------------------
+# Config helpers
+# -----------------------------------------------------------------------------
+
+
+def _read_config_value(key: str, default: Optional[str] = None) -> Optional[str]:
+    env_value = os.getenv(key)
+    if env_value not in (None, ""):
+        return env_value
+
+    try:
+        if key in st.secrets:
+            secret_value = st.secrets[key]
+            if secret_value not in (None, ""):
+                return str(secret_value)
+
+        db_section = st.secrets.get("database", {})
+        if hasattr(db_section, "get"):
+            for candidate in (key, key.lower(), key.upper()):
+                section_value = db_section.get(candidate)
+                if section_value not in (None, ""):
+                    return str(section_value)
+    except Exception:
+        pass
+
+    return default
+
+
+def get_connection_params(selected_database: Optional[str] = None) -> Dict[str, Any]:
+    host = _read_config_value("DB_HOST", DEFAULT_DB_HOST)
+    port_raw = _read_config_value("DB_PORT", str(DEFAULT_DB_PORT))
+    user = _read_config_value("DB_USER", DEFAULT_DB_USER)
+    password = _read_config_value("DB_PASSWORD", DB_PASSWORD)
+    database = selected_database or _read_config_value("DB_NAME", DEFAULT_DB_NAME)
+
+    try:
+        port = int(port_raw) if port_raw is not None else DEFAULT_DB_PORT
+    except (TypeError, ValueError):
+        port = DEFAULT_DB_PORT
+
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": database,
+        "ssl_disabled": False,
+    }
+
+
+# -----------------------------------------------------------------------------
+# DB helpers – each call opens/closes its own connection for concurrency
+# -----------------------------------------------------------------------------
+
+
+def get_db_connection(
+    connection_params: Dict[str, Any],
+    database_override: Optional[str] = None,
+) -> mysql.connector.MySQLConnection:
+    connect_kwargs: Dict[str, Any] = {
+        "host": connection_params["host"],
+        "port": int(connection_params["port"]),
+        "user": connection_params["user"],
+        "password": connection_params["password"],
+        "ssl_disabled": bool(connection_params.get("ssl_disabled", False)),
+        "use_pure": True,
+        "consume_results": True,
+        "autocommit": True,
+    }
+
+    database = database_override if database_override is not None else connection_params.get("database")
+    if database:
+        connect_kwargs["database"] = database
+
+    return mysql.connector.connect(**connect_kwargs)
+
+
+def get_safe_cursor(
+    connection_params: Dict[str, Any],
+    database_override: Optional[str] = None,
+) -> Tuple[mysql.connector.cursor.MySQLCursor, mysql.connector.MySQLConnection]:
+    conn = get_db_connection(connection_params, database_override=database_override)
+    return conn.cursor(buffered=True), conn
+
+
+def safe_close_cursor_conn(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    conn: mysql.connector.MySQLConnection,
+) -> None:
+    try:
+        conn.consume_results()
+    except Exception:
+        pass
+
+    try:
+        cursor.close()
+    except mysql.connector.errors.InternalError:
+        try:
+            conn.consume_results()
+        except Exception:
+            pass
+        try:
+            cursor.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def execute_sql(
+    sql: str,
+    connection_params: Dict[str, Any],
+    params: Optional[Tuple[Any, ...]] = None,
+    database_override: Optional[str] = None,
+) -> pd.DataFrame:
+    cursor, conn = get_safe_cursor(connection_params, database_override=database_override)
+    try:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        cols = cursor.column_names
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        safe_close_cursor_conn(cursor, conn)
+
+
+# -----------------------------------------------------------------------------
+# Router SQL file helpers
+# -----------------------------------------------------------------------------
+
+
+def _read_router_sql_file(filename: str) -> str:
+    path = os.path.join(ROUTER_SQL_DIR, filename)
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _column_exists(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    schema_name: str,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    cursor.execute(
+        (
+            "SELECT COUNT(*) "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = %s"
+        ),
+        (schema_name, table_name, column_name),
+    )
+    row = cursor.fetchone()
+    return bool(row and int(row[0]) > 0)
+
+
+def _ensure_router_log_columns(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    """Backward-compatible migration for older demo.ai_router_log layouts."""
+    if not _column_exists(cursor, "demo", "ai_router_log", "route_confidence"):
+        cursor.execute(
+            "ALTER TABLE demo.ai_router_log "
+            "ADD COLUMN route_confidence DECIMAL(5,2) NULL AFTER route"
+        )
+
+    if not _column_exists(cursor, "demo", "ai_router_log", "ambiguity_flag"):
+        cursor.execute(
+            "ALTER TABLE demo.ai_router_log "
+            "ADD COLUMN ambiguity_flag TINYINT(1) NOT NULL DEFAULT 0 "
+            "AFTER route_confidence"
+        )
+
+    if not _column_exists(cursor, "demo", "ai_router_log", "cache_hit"):
+        cursor.execute(
+            "ALTER TABLE demo.ai_router_log "
+            "ADD COLUMN cache_hit TINYINT(1) NOT NULL DEFAULT 0 "
+            "AFTER ambiguity_flag"
+        )
+
+
+def _split_simple_sql_statements(script: str) -> List[str]:
+    cleaned_lines = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        cleaned_lines.append(line)
+
+    cleaned_script = "\n".join(cleaned_lines)
+
+    statements: List[str] = []
+    token: List[str] = []
+    in_single_quote = False
+    in_double_quote = False
+    escape_next = False
+
+    for char in cleaned_script:
+        token.append(char)
+
+        if escape_next:
+            escape_next = False
+            continue
+
+        if char == "\\":
+            escape_next = True
+            continue
+
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            continue
+
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            continue
+
+        if char == ";" and not in_single_quote and not in_double_quote:
+            statement = "".join(token).strip()
+            if statement:
+                statements.append(statement)
+            token = []
+
+    tail = "".join(token).strip()
+    if tail:
+        statements.append(tail)
+
+    return statements
+
+
+def apply_router_sql_bundle(connection_params: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    cursor, conn = get_safe_cursor(connection_params, database_override=None)
+    try:
+        if st.session_state.get(ROUTER_SETUP_STATE_KEY):
+            _ensure_router_log_columns(cursor)
+            return True, None
+
+        for filename, mode in ROUTER_SQL_PLAN:
+            sql_text = _read_router_sql_file(filename)
+            if mode == "multi":
+                for statement in _split_simple_sql_statements(sql_text):
+                    cursor.execute(statement)
+            else:
+                cursor.execute(sql_text.strip())
+
+        _ensure_router_log_columns(cursor)
+        cursor.execute("CALL demo.refresh_router_schema_hints()")
+
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+        st.session_state[ROUTER_SETUP_STATE_KEY] = True
+        return True, None
+    except FileNotFoundError as err:
+        return False, f"Router SQL file missing: {err}"
+    except mysql.connector.Error as err:
+        return False, str(err)
+    finally:
+        safe_close_cursor_conn(cursor, conn)
+
+
+# -----------------------------------------------------------------------------
+# Model catalog and NL_SQL helpers
+# -----------------------------------------------------------------------------
+
+
+def refresh_model_catalog(connection_params: Dict[str, Any]) -> None:
     """Refresh model options and restricted models from the system catalog."""
     global MODEL_OPTIONS, restricted_models, default_model
     try:
-        catalog_df = execute_sql(MODEL_CATALOG_QUERY)
-        generation_df = execute_sql(GENERATION_MODELS_QUERY)
+        catalog_df = execute_sql(MODEL_CATALOG_QUERY, connection_params)
+        generation_df = execute_sql(GENERATION_MODELS_QUERY, connection_params)
     except Exception:
         MODEL_OPTIONS = []
         restricted_models = []
@@ -79,85 +381,37 @@ def refresh_model_catalog():
     else:
         restricted_models = []
 
-# -----------------------------------------------------------------------------
-# DB helpers – each call opens/closes its own connection for concurrency
-# -----------------------------------------------------------------------------
 
-def get_db_connection():
-    """Open a brand-new connection on each call (drop cached connection to allow concurrency)."""
-    return mysql.connector.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        ssl_disabled=False,
-        use_pure=True,
-        consume_results=True
-    )
-
-def get_safe_cursor():
-    """Return a fresh *buffered* cursor and its connection for each query."""
-    conn = get_db_connection()
-    # buffered=True ensures result sets are fully fetched client-side, avoiding
-    # `InternalError: Unread result found` when closing cursors/connections.
-    return conn.cursor(buffered=True), conn
-
-def safe_close_cursor_conn(cursor, conn) -> None:
-    """Best-effort cleanup that avoids mysql-connector 'Unread result found' on close."""
-    # First try to consume any pending results.
-    try:
-        conn.consume_results()
-    except Exception:
-        pass
-
-    # Closing the cursor can itself raise if unread results are still present.
-    try:
-        cursor.close()
-    except mysql.connector.errors.InternalError:
-        # Try one more consume + close cycle
+def _extract_generated_sql_from_nl_info_rows(rows: List[Tuple[Any, ...]], current_sql: str = "") -> str:
+    generated_sql = current_sql
+    for row in rows:
         try:
-            conn.consume_results()
-        except Exception:
-            pass
-        try:
-            cursor.close()
-        except Exception:
-            pass
+            info = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError, IndexError):
+            continue
 
-    # Close connection last.
-    try:
-        conn.close()
-    except Exception:
-        pass
+        if info.get("stage") == "validated_sql":
+            message = str(info.get("message", ""))
+            marker = "Generated SQL statement:"
+            if marker in message:
+                generated_sql = message.split(marker, 1)[1].strip()
 
-def execute_sql(sql: str) -> pd.DataFrame:
-    """
-    Execute a SQL query using a new cursor/connection per call,
-    ensuring resources are closed promptly.
-    """
-    cursor, conn = get_safe_cursor()
-    try:
-        cursor.execute(sql)
-        rows = cursor.fetchall()
-        cols = cursor.column_names
-        return pd.DataFrame(rows, columns=cols)
-    finally:
-        safe_close_cursor_conn(cursor, conn)
+    return generated_sql
 
-# -----------------------------------------------------------------------------
-# LLM / text helpers
-# -----------------------------------------------------------------------------
 
-def run_nl_sql(natural_language_statement: str, model_id: str):
+def run_nl_sql(
+    natural_language_statement: str,
+    model_id: str,
+    connection_params: Dict[str, Any],
+) -> Tuple[Any, str]:
     """
     Execute NL_SQL and return:
-    1) the final query result as DataFrame (or message string on failure/no rows)
-    2) the generated SQL extracted from the verbose NL_SQL info stream.
+    1) final query result as DataFrame (or message string)
+    2) generated SQL extracted from the NL_SQL info stream.
     """
-    cursor, conn = get_safe_cursor()
+    cursor, conn = get_safe_cursor(connection_params)
     generated_sql = ""
-    result_frames = []
+    result_frames: List[pd.DataFrame] = []
 
     try:
         options = json.dumps(
@@ -168,9 +422,6 @@ def run_nl_sql(natural_language_statement: str, model_id: str):
             }
         )
 
-        # Use callproc + stored_results instead of execute(CALL...) + nextset().
-        # With mysql-connector pure-python cursors, nextset() is not implemented,
-        # which can leave unread results and trigger InternalError on close.
         output_vars = cursor.callproc(
             "sys.NL_SQL",
             (natural_language_statement, None, options),
@@ -181,16 +432,7 @@ def run_nl_sql(natural_language_statement: str, model_id: str):
             cols = list(stored_result.column_names)
 
             if rows and cols == ["nl_sql_info"]:
-                for row in rows:
-                    try:
-                        info = json.loads(row[0])
-                    except (TypeError, json.JSONDecodeError):
-                        continue
-                    if info.get("stage") == "validated_sql":
-                        message = str(info.get("message", ""))
-                        marker = "Generated SQL statement:"
-                        if marker in message:
-                            generated_sql = message.split(marker, 1)[1].strip()
+                generated_sql = _extract_generated_sql_from_nl_info_rows(rows, generated_sql)
             elif rows:
                 result_frames.append(pd.DataFrame(rows, columns=cols))
 
@@ -226,416 +468,613 @@ def run_nl_sql(natural_language_statement: str, model_id: str):
     finally:
         safe_close_cursor_conn(cursor, conn)
 
-def parse_ml_generate_response(raw_response: Any) -> str:
-    """Parse ML_GENERATE output and return plain text."""
-    if not isinstance(raw_response, str):
-        return str(raw_response)
+
+def ensure_smart_ask_objects(connection_params: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Ensure demo schema/log tables/procedures/triggers exist using external SQL files."""
+    return apply_router_sql_bundle(connection_params)
+
+
+def _extract_generated_sql_from_smart_ask_answer(answer: str) -> str:
+    if not answer:
+        return ""
+
     try:
-        parsed = json.loads(raw_response)
-        if isinstance(parsed, dict) and "text" in parsed:
-            return str(parsed["text"]).strip()
+        parsed = json.loads(answer)
     except json.JSONDecodeError:
-        pass
-    return raw_response.strip()
+        return ""
 
-def call_ml_generate_text(prompt_text: str, model_id: str, language: str) -> str:
-    """Run ML_GENERATE with a text prompt and return normalized text."""
-    cursor, conn = get_safe_cursor()
-    try:
-        cursor.execute(
-            (
-                "SELECT sys.ML_GENERATE(%s, "
-                "JSON_OBJECT('task','generation','model_id',%s,'language',%s,'max_tokens',4000)) "
-                "AS response;"
-            ),
-            (prompt_text, model_id, language)
-        )
-        return parse_ml_generate_response(cursor.fetchall()[0][0])
-    finally:
-        safe_close_cursor_conn(cursor, conn)
+    if not isinstance(parsed, dict):
+        return ""
 
-def contextualize_question_with_history(
-    user_question: str,
-    user_language: str,
-    model_id: str,
-    history_messages: List[Any]
-) -> str:
-    """Rewrite follow-up questions into standalone prompts using chat history."""
-    if not history_messages:
-        return user_question
+    return str(parsed.get("generated_sql", "")).strip()
 
-    history_lines = []
-    for msg in history_messages[-12:]:
-        content = str(getattr(msg, "content", "")).strip()
-        if not content:
-            continue
-        role = "assistant"
-        if LANGCHAIN_AVAILABLE and isinstance(msg, HumanMessage):
-            role = "user"
-        history_lines.append(f"{role}: {content}")
 
-    if not history_lines:
-        return user_question
-
-    rewrite_prompt = (
-        "Rewrite the final user message as a standalone analytics question for SQL generation. "
-        "Keep the original intent and constraints. Return only the rewritten question.\n\n"
-        f"Conversation:\n{chr(10).join(history_lines)}\n"
-        f"Final user message:\n{user_question}"
-    )
+def run_smart_ask(user_question: str, connection_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Call demo.smart_ask and return route, answer, generated SQL, and optional SQL table output."""
+    cursor, conn = get_safe_cursor(connection_params)
+    route = "LLM"
+    answer = ""
+    generated_sql = ""
+    log_id: Optional[int] = None
+    result_frames: List[pd.DataFrame] = []
 
     try:
-        rewritten = call_ml_generate_text(rewrite_prompt, model_id, user_language)
-        return rewritten if rewritten else user_question
-    except Exception:
-        return user_question
+        out_params = cursor.callproc("demo.smart_ask", (user_question, "", ""))
+        if len(out_params) >= 3:
+            route = str(out_params[1] or "LLM").strip().upper()
+            answer = str(out_params[2] or "").strip()
 
-if LANGCHAIN_AVAILABLE:
-    @tool("run_nl_sql_tool")
-    def run_nl_sql_tool(question: str, model_id: str) -> str:
-        """Execute NL_SQL and return generated SQL plus result payload."""
-        result, generated_sql = run_nl_sql(question, model_id)
-        if isinstance(result, pd.DataFrame):
-            payload = {
-                "kind": "table",
-                "generated_sql": generated_sql,
-                "columns": result.columns.tolist(),
-                "rows": result.values.tolist()
-            }
-        else:
-            payload = {
-                "kind": "message",
-                "generated_sql": generated_sql,
-                "message": str(result)
-            }
-        return json.dumps(payload, default=str)
+        for stored_result in cursor.stored_results():
+            rows = stored_result.fetchall()
+            cols = list(stored_result.column_names)
 
-    @tool("generate_nl_answer_tool")
-    def generate_nl_answer_tool(
-        user_question: str,
-        table_payload: str,
-        user_language: str,
-        model_id: str
-    ) -> str:
-        """Generate a natural-language answer from tabular payload."""
+            if rows and cols == ["nl_sql_info"]:
+                generated_sql = _extract_generated_sql_from_nl_info_rows(rows, generated_sql)
+            elif rows:
+                result_frames.append(pd.DataFrame(rows, columns=cols))
+
+            try:
+                stored_result.close()
+            except Exception:
+                pass
+
+        if not generated_sql:
+            generated_sql = _extract_generated_sql_from_smart_ask_answer(answer)
+
+        cursor.execute("SELECT @smart_ask_log_id")
+        log_row = cursor.fetchone()
+        if log_row and log_row[0] is not None:
+            try:
+                log_id = int(log_row[0])
+            except (TypeError, ValueError):
+                log_id = None
+
         try:
-            parsed = json.loads(table_payload)
-        except json.JSONDecodeError:
-            return str(table_payload)
+            conn.commit()
+        except Exception:
+            pass
 
-        if parsed.get("kind") != "table":
-            return str(parsed.get("message", "No tabular output."))
-
-        table_df = pd.DataFrame(parsed.get("rows", []), columns=parsed.get("columns", []))
-        return generate_natural_language_answer(user_question, table_df, user_language, model_id)
-
-    def get_langchain_history(session_id: str) -> BaseChatMessageHistory:
-        """Get or create per-session chat history used by LangChain."""
-        if "lc_history_store" not in st.session_state:
-            st.session_state["lc_history_store"] = {}
-
-        history_store = st.session_state["lc_history_store"]
-        if session_id not in history_store:
-            history_store[session_id] = InMemoryChatMessageHistory()
-        return history_store[session_id]
-
-    def stateful_tool_entrypoint(inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """LangChain runnable entrypoint with history-aware orchestration."""
-        question = str(inputs.get("question", "")).strip()
-        model_id = str(inputs.get("model_id", "")).strip()
-        user_language = str(inputs.get("user_language", "en")).strip()
-        use_nl = bool(inputs.get("use_nl", False))
-        max_nl_lines = int(inputs.get("max_nl_lines", 24))
-        override_nl = bool(inputs.get("override_nl", False))
-        history_messages = inputs.get("history", [])
-
-        standalone_question = contextualize_question_with_history(
-            question, user_language, model_id, history_messages
-        )
-        tool_raw = run_nl_sql_tool.invoke({"question": standalone_question, "model_id": model_id})
-        try:
-            tool_payload = json.loads(tool_raw)
-        except json.JSONDecodeError:
-            tool_payload = {"kind": "message", "message": str(tool_raw), "generated_sql": ""}
-
-        generated_sql = str(tool_payload.get("generated_sql", ""))
-
-        if (model_id in restricted_models) and (not override_nl):
-            use_nl = False
-
-        if tool_payload.get("kind") == "table":
-            columns = tool_payload.get("columns", [])
-            rows = tool_payload.get("rows", [])
-            table_df = pd.DataFrame(rows, columns=columns)
-
-            if use_nl and len(table_df) <= max_nl_lines:
-                nl_answer = generate_nl_answer_tool.invoke(
-                    {
-                        "user_question": question,
-                        "table_payload": json.dumps(tool_payload),
-                        "user_language": user_language,
-                        "model_id": model_id
-                    }
-                )
-                return {
-                    "answer": nl_answer,
-                    "render_type": "text",
-                    "render_payload": nl_answer,
-                    "generated_sql": generated_sql
-                }
-
-            return {
-                "answer": f"Returned {len(table_df)} row(s).",
-                "render_type": "table",
-                "render_payload": {
-                    "columns": columns,
-                    "rows": rows
-                },
-                "generated_sql": generated_sql
-            }
-
-        message = str(tool_payload.get("message", "No output returned."))
         return {
-            "answer": message,
-            "render_type": "text",
-            "render_payload": message,
-            "generated_sql": generated_sql
+            "route": route,
+            "answer": answer,
+            "generated_sql": generated_sql,
+            "log_id": log_id,
+            "table": result_frames[-1] if result_frames else None,
         }
-
-    def get_stateful_runnable() -> RunnableWithMessageHistory:
-        """Create one history-aware runnable per Streamlit session."""
-        if "stateful_langchain_runnable" not in st.session_state:
-            st.session_state["stateful_langchain_runnable"] = RunnableWithMessageHistory(
-                RunnableLambda(stateful_tool_entrypoint),
-                get_langchain_history,
-                input_messages_key="question",
-                history_messages_key="history",
-                output_messages_key="answer"
-            )
-        return st.session_state["stateful_langchain_runnable"]
-
-def full_pipeline_stateful(
-    user_question: str,
-    user_language: str,
-    model_id: str,
-    use_nl: bool,
-    max_nl_lines: int,
-    override_nl: bool = False
-):
-    """Run the history-aware LangChain pipeline; fallback to stateless path."""
-    if not LANGCHAIN_AVAILABLE:
-        return full_pipeline(user_question, user_language, model_id, use_nl, max_nl_lines, override_nl)
-
-    if "lc_session_id" not in st.session_state:
-        st.session_state["lc_session_id"] = str(uuid.uuid4())
-
-    runnable = get_stateful_runnable()
-    response = runnable.invoke(
-        {
-            "question": user_question,
-            "user_language": user_language,
-            "model_id": model_id,
-            "use_nl": use_nl,
-            "max_nl_lines": max_nl_lines,
-            "override_nl": override_nl
-        },
-        config={"configurable": {"session_id": st.session_state["lc_session_id"]}}
-    )
-
-    render_type = response.get("render_type", "text")
-    generated_sql = str(response.get("generated_sql", ""))
-    if render_type == "table":
-        payload = response.get("render_payload", {})
-        if isinstance(payload, dict):
-            return pd.DataFrame(payload.get("rows", []), columns=payload.get("columns", [])), generated_sql
-    return response.get("render_payload", ""), generated_sql
-
-def generate_natural_language_answer(
-    user_question: str,
-    final_df,
-    user_language: str,
-    model_id: str
-) -> str:
-    """Turn a small result set into a natural-language answer."""
-    cursor, conn = get_safe_cursor()
-    try:
-        text_context = final_df.to_string(index=False) if isinstance(final_df, pd.DataFrame) else str(final_df)
-        prompt = (
-            f"Respond to: {user_question}\nUsing context:\n{text_context}"
-        ).replace("'", "\\'")
-        sql = (
-            f"SELECT sys.ML_GENERATE('{prompt}', "
-            f"JSON_OBJECT('task','generation','model_id','{model_id}','language','{user_language}','max_tokens',4000)) "
-            "AS response;"
-        )
-        cursor.execute(sql)
-        return parse_ml_generate_response(cursor.fetchall()[0][0])
+    except mysql.connector.Error as err:
+        return {
+            "route": "LLM",
+            "answer": f"❌ smart_ask failed: {err}",
+            "generated_sql": "",
+            "log_id": None,
+            "table": None,
+        }
     finally:
         safe_close_cursor_conn(cursor, conn)
 
-def full_pipeline(user_question, user_language, model_id,
-                  use_nl, max_nl_lines, override_nl=False):
-    final_result, generated_sql = run_nl_sql(user_question, model_id)
 
-    if (model_id in restricted_models) and (not override_nl):
-        use_nl = False
-
-    n = len(final_result) if isinstance(final_result, pd.DataFrame) else 0
-
-    if use_nl and isinstance(final_result, pd.DataFrame) and n <= max_nl_lines:
-        answer = generate_natural_language_answer(
-            user_question, final_result, user_language, model_id
+def submit_router_feedback(
+    router_log_id: int,
+    feedback_type: str,
+    connection_params: Dict[str, Any],
+    feedback_note: Optional[str] = None,
+) -> Tuple[bool, str]:
+    cursor, conn = get_safe_cursor(connection_params)
+    try:
+        cursor.callproc(
+            "demo.submit_router_feedback",
+            (int(router_log_id), str(feedback_type), feedback_note or ""),
         )
-        return answer, generated_sql
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        return True, "Feedback saved."
+    except mysql.connector.Error as err:
+        return False, str(err)
+    finally:
+        safe_close_cursor_conn(cursor, conn)
 
-    return final_result, generated_sql
 
-def add_footer():
+def render_feedback_controls(router_log_id: Optional[int], connection_params: Dict[str, Any]) -> None:
+    if not router_log_id:
+        return
+
+    state_key = f"_router_feedback_{router_log_id}"
+    submitted_feedback = st.session_state.get(state_key)
+
+    st.caption("Rate this router result:")
+    col_up, col_down, _ = st.columns([1, 1, 6])
+
+    with col_up:
+        up_clicked = st.button(
+            "👍🏻",
+            key=f"feedback_up_{router_log_id}",
+            disabled=bool(submitted_feedback),
+        )
+    with col_down:
+        down_clicked = st.button(
+            "👎🏻",
+            key=f"feedback_down_{router_log_id}",
+            disabled=bool(submitted_feedback),
+        )
+
+    if up_clicked or down_clicked:
+        feedback_type = "up" if up_clicked else "down"
+        ok, message = submit_router_feedback(router_log_id, feedback_type, connection_params)
+        if ok:
+            st.session_state[state_key] = feedback_type
+            st.success("Feedback recorded.")
+        else:
+            st.error(f"Feedback failed: {message}")
+
+
+# -----------------------------------------------------------------------------
+# Chat and response helpers
+# -----------------------------------------------------------------------------
+
+
+def message_to_memory_text(message: Dict[str, Any]) -> str:
+    msg_type = str(message.get("type", "text"))
+    if msg_type != "table":
+        return str(message.get("content", "")).strip()
+
+    payload = message.get("payload", {})
+    if not isinstance(payload, dict):
+        return ""
+
+    columns = payload.get("columns", [])
+    rows = payload.get("rows", [])
+    preview_df = pd.DataFrame(rows[:5], columns=columns)
+    preview_text = preview_df.to_string(index=False) if not preview_df.empty else "(empty result)"
+    return (
+        f"Returned table with {len(rows)} row(s) and columns {', '.join(map(str, columns))}.\n"
+        f"Preview:\n{preview_text}"
+    )
+
+
+def format_recent_turns(messages: List[Dict[str, Any]], max_turns: int = 12) -> str:
+    """Format the last ~12 turns as Human/AI lines for LLM prompts."""
+    relevant_messages = messages[-(max_turns * 2):]
+    lines: List[str] = []
+
+    for msg in relevant_messages:
+        role = "Human" if msg.get("role") == "user" else "AI"
+        content = message_to_memory_text(msg)
+        if content:
+            lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
+
+
+def get_session_heatwave_llm(model_id: str, connection_params: Dict[str, Any]) -> HeatWaveLLM:
+    signature = (
+        model_id,
+        connection_params.get("host"),
+        int(connection_params.get("port", DEFAULT_DB_PORT)),
+        connection_params.get("user"),
+        connection_params.get("password"),
+        connection_params.get("database"),
+    )
+
+    cached_client = st.session_state.get("_heatwave_llm_client")
+    cached_signature = st.session_state.get("_heatwave_llm_signature")
+
+    if cached_client is not None and cached_signature == signature:
+        return cached_client
+
+    if cached_client is not None:
+        try:
+            cached_client.close()
+        except Exception:
+            pass
+
+    client = HeatWaveLLM(model_id=model_id, connection_params=connection_params)
+    st.session_state["_heatwave_llm_client"] = client
+    st.session_state["_heatwave_llm_signature"] = signature
+    _track_llm_client(client)
+    return client
+
+
+def chat_with_memory(
+    user_language: str,
+    model_id: str,
+    connection_params: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    extra_context: Optional[str] = None,
+) -> str:
+    llm = get_session_heatwave_llm(model_id=model_id, connection_params=connection_params)
+    history_text = format_recent_turns(messages, max_turns=12)
+
+    context_block = ""
+    if extra_context:
+        context_block = (
+            "\nAdditional router context (use as supporting signal, do not mention it verbatim to the user):\n"
+            f"{extra_context}\n"
+        )
+
+    prompt = (
+        "You are a helpful chat assistant with conversation memory. "
+        "Use the conversation context and answer the latest Human message directly. "
+        f"Respond in language code '{user_language}'.\n\n"
+        "Conversation:\n"
+        f"{history_text}"
+        f"{context_block}\n"
+        "AI:"
+    )
+    return llm.invoke(prompt)
+
+
+def explain_sql_result_with_llm(
+    user_question: str,
+    result_df: pd.DataFrame,
+    generated_sql: str,
+    user_language: str,
+    model_id: str,
+    connection_params: Dict[str, Any],
+) -> str:
+    llm = get_session_heatwave_llm(model_id=model_id, connection_params=connection_params)
+
+    table_text = result_df.to_string(index=False)
+    prompt = (
+        "You are a data assistant. Explain this SQL result in clear natural language. "
+        f"Respond in language code '{user_language}'.\n\n"
+        f"User question:\n{user_question}\n\n"
+        f"Generated SQL:\n{generated_sql or '(not available)'}\n\n"
+        f"Result table:\n{table_text}\n"
+    )
+    return llm.invoke(prompt)
+
+
+def render_and_store_sql_response(
+    output: Any,
+    generated_sql: str,
+    user_question: str,
+    show_sql: str,
+    explain_result: bool,
+    explain_threshold: int,
+    user_language: str,
+    model_id: str,
+    connection_params: Dict[str, Any],
+    message_mode: str,
+) -> None:
+    if isinstance(output, pd.DataFrame):
+        st.dataframe(output)
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "type": "table",
+                "content": f"✅ Returned {len(output)} row(s).",
+                "payload": {
+                    "columns": output.columns.tolist(),
+                    "rows": output.values.tolist(),
+                },
+                "generated_sql": generated_sql,
+                "mode": message_mode,
+            }
+        )
+
+        if show_sql == "Yes" and generated_sql:
+            st.code(generated_sql, language="sql")
+
+        if explain_result and len(output) <= explain_threshold:
+            with st.spinner("Explaining result..."):
+                try:
+                    explanation = explain_sql_result_with_llm(
+                        user_question=user_question,
+                        result_df=output,
+                        generated_sql=generated_sql,
+                        user_language=user_language,
+                        model_id=model_id,
+                        connection_params=connection_params,
+                    )
+                except Exception as err:
+                    explanation = f"❌ Explanation failed: {err}"
+
+            st.markdown(explanation)
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "type": "text",
+                    "content": str(explanation),
+                    "mode": message_mode,
+                }
+            )
+        return
+
+    st.markdown(str(output))
+    if show_sql == "Yes" and generated_sql:
+        st.code(generated_sql, language="sql")
+
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "type": "text",
+            "content": str(output),
+            "generated_sql": generated_sql,
+            "mode": message_mode,
+        }
+    )
+
+
+# -----------------------------------------------------------------------------
+# UI helpers
+# -----------------------------------------------------------------------------
+
+
+def add_footer() -> None:
     st.markdown(
         """
         <style>
-        /* Default (desktop) */
           [data-testid='stChatInput'] { bottom: 50px !important; }
-
-          /* Mobile: width less than 768px */
           @media (max-width: 767px) {
             [data-testid='stChatInput'] { bottom: 90px !important; }
           }
 
-        #fixed-footer { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; padding: 10px; font-size: 16px; color: gray; text-align: center; z-index: 10000; }
+        #fixed-footer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            width: 100%;
+            padding: 10px;
+            font-size: 16px;
+            color: gray;
+            text-align: center;
+            z-index: 10000;
+        }
         </style>
         <div id="fixed-footer">
             This interface is for demonstrative purposes only. This is not a tool supported by Oracle.
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-# -----------------------------------------------------------------------------
-# Chat rendering helpers
-# -----------------------------------------------------------------------------
 
-def render_chat_message(message: Dict[str, Any]) -> None:
-    """Render a stored chat message, including persisted table payloads."""
+def render_chat_message(message: Dict[str, Any], show_generated_sql: bool) -> None:
     role = str(message.get("role", "assistant"))
     with st.chat_message(role):
         msg_type = str(message.get("type", "text"))
+
         if msg_type == "table":
             payload = message.get("payload", {})
             if isinstance(payload, dict):
                 columns = payload.get("columns", [])
                 rows = payload.get("rows", [])
                 st.dataframe(pd.DataFrame(rows, columns=columns))
+
+                if show_generated_sql:
+                    generated_sql = str(message.get("generated_sql", "")).strip()
+                    if generated_sql:
+                        st.code(generated_sql, language="sql")
                 return
+
         st.markdown(str(message.get("content", "")))
 
+        if show_generated_sql:
+            generated_sql = str(message.get("generated_sql", "")).strip()
+            if generated_sql:
+                st.code(generated_sql, language="sql")
+
+
 # -----------------------------------------------------------------------------
-# Streamlit App UI
+# Streamlit App
 # -----------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     global DB_NAME, DBSYSTEM_SCHEMA
 
-    st.title("Natural Language → SQL Chatbot")
+    st.title("Chat Assistant with NL2SQL")
 
-    if 'messages' not in st.session_state:
+    if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    base_connection_params = get_connection_params()
+    if not base_connection_params.get("password"):
+        st.error("Missing database password. Configure DB_PASSWORD in Streamlit secrets or environment variables.")
+        st.info("Example env var: DB_PASSWORD=your_password")
+        st.stop()
+
+    router_ready = False
+    router_error: Optional[str] = None
+
     with st.sidebar:
-        refresh_model_catalog()
+        refresh_model_catalog(base_connection_params)
         if not MODEL_OPTIONS:
             st.error("No generation-capable models found in sys.ML_SUPPORTED_LLMS.")
             st.stop()
-        if not LANGCHAIN_AVAILABLE:
-            st.warning("LangChain not installed. Running stateless mode.")
 
-        # Schema selection menu (above model list)
         try:
-            schemas_df = execute_sql("SHOW SCHEMAS;")
-            schema_list = schemas_df[schemas_df.columns[0]].tolist()
+            schemas_df = execute_sql("SHOW SCHEMAS;", base_connection_params)
+            schema_list = schemas_df[schemas_df.columns[0]].dropna().astype(str).tolist()
         except Exception:
             schema_list = []
+
+        if not schema_list:
+            fallback_schema = str(base_connection_params.get("database") or DEFAULT_DB_NAME)
+            schema_list = [fallback_schema]
+
+        default_schema = DB_NAME if DB_NAME in schema_list else schema_list[0]
         selected_schema = st.selectbox(
-            "Select database schema:", schema_list,
-            index=schema_list.index(DB_NAME) if DB_NAME in schema_list else 0
+            "Select database schema:",
+            schema_list,
+            index=schema_list.index(default_schema),
         )
         DB_NAME = selected_schema
         DBSYSTEM_SCHEMA = selected_schema
 
-        # Model controls
-        default_index = MODEL_OPTIONS.index(default_model) if default_model in MODEL_OPTIONS else 0
-        model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=default_index)
-        
-        # 1) detect the restricted models as before
-        nl_disabled = model_id in restricted_models
+        connection_params = get_connection_params(selected_database=selected_schema)
 
-        # 2) offer an override checkbox that’s only visible when the model is restricted
+        router_ready, router_error = ensure_smart_ask_objects(connection_params)
+        if not router_ready and router_error:
+            st.warning(f"`demo.smart_ask` unavailable: {router_error}")
+
+        default_index = MODEL_OPTIONS.index(default_model) if default_model in MODEL_OPTIONS else 0
+        selected_model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=default_index)
+
+        mode = st.selectbox("Mode", ["Auto", "Chat", "SQL"], index=0)
+
+        nl_disabled = selected_model_id in restricted_models
         override_nl = False
         if nl_disabled:
             override_nl = st.checkbox(
-                "⚠️ Force‐enable NL even on restricted model", 
+                "⚠️ Force-enable NL even on restricted model",
                 value=False,
-                help="Only use if you know what you’re doing"
+                help="Only use if you know what you are doing",
             )
 
-        # 3) compute whether the NL toggle should actually be disabled
         effective_disabled = nl_disabled and not override_nl
 
-        # 4) the main NL checkbox uses that
-        use_nl = st.checkbox(
-            "Natural Language Response",
-            value=not nl_disabled or override_nl,
-            disabled=effective_disabled
+        explain_result = st.checkbox(
+            "Explain result in natural language",
+            value=not effective_disabled,
+            disabled=effective_disabled,
         )
 
-        # 5) threshold only enabled when use_nl is true
-        max_nl = st.number_input(
-            "NL Response Threshold:", 
-            min_value=1, 
-            value=24, 
-            disabled=not use_nl
+        explain_threshold = int(
+            st.number_input(
+                "Explain threshold (rows):",
+                min_value=1,
+                value=24,
+                disabled=not explain_result,
+            )
         )
+
         language = st.selectbox("Language:", ["en", "es", "pt", "fr"], index=0)
         show_sql = st.radio("Show generated SQL?", ["No", "Yes"], index=0)
 
-    # Display past chat messages
     for msg in st.session_state.messages:
-        render_chat_message(msg)
+        render_chat_message(msg, show_generated_sql=(show_sql == "Yes"))
 
-    # Handle new user prompt
     if prompt := st.chat_input("Ask your question..."):
-        st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "type": "text",
+                "content": prompt,
+                "mode": mode.lower(),
+            }
+        )
+
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Running query..."):
-                output, generated_sql = full_pipeline_stateful(
-                    prompt, language, model_id, use_nl, max_nl, override_nl
-                )
-                if isinstance(output, pd.DataFrame):
-                    st.dataframe(output)
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "type": "table",
-                            "content": "✅ Returned a data table.",
-                            "payload": {
-                                "columns": output.columns.tolist(),
-                                "rows": output.values.tolist(),
-                            },
-                        }
-                    )
+            active_mode = mode.lower()
+
+            if active_mode == "auto":
+                if not router_ready:
+                    st.caption("Auto router unavailable; falling back to CHAT mode.")
+                    active_mode = "chat"
                 else:
-                    st.markdown(output)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "type": "text", "content": str(output)}
+                    with st.spinner("Routing with demo.smart_ask..."):
+                        router_output = run_smart_ask(prompt, connection_params)
+
+                    router_route = str(router_output.get("route", "LLM")).upper()
+                    router_answer = str(router_output.get("answer", "")).strip()
+                    generated_sql = str(router_output.get("generated_sql", "")).strip()
+                    router_log_id = router_output.get("log_id")
+                    router_table = router_output.get("table")
+
+                    st.caption(f"Auto routed by `demo.smart_ask` to `{router_route}`.")
+
+                    if router_route == "SQL":
+                        sql_output: Any = router_table if isinstance(router_table, pd.DataFrame) else router_answer
+                        render_and_store_sql_response(
+                            output=sql_output,
+                            generated_sql=generated_sql,
+                            user_question=prompt,
+                            show_sql=show_sql,
+                            explain_result=explain_result,
+                            explain_threshold=explain_threshold,
+                            user_language=language,
+                            model_id=selected_model_id,
+                            connection_params=connection_params,
+                            message_mode="auto_sql",
+                        )
+                    else:
+                        context_for_llm = (
+                            f"smart_ask route: {router_route}\n"
+                            f"smart_ask answer/context:\n{router_answer or '(empty)'}"
+                        )
+                        with st.spinner("Thinking..."):
+                            try:
+                                answer = chat_with_memory(
+                                    user_language=language,
+                                    model_id=selected_model_id,
+                                    connection_params=connection_params,
+                                    messages=st.session_state.messages,
+                                    extra_context=context_for_llm,
+                                )
+                            except Exception as err:
+                                answer = f"❌ Chat failed: {err}"
+
+                        st.markdown(answer)
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "type": "text",
+                                "content": str(answer),
+                                "mode": "auto_chat",
+                            }
+                        )
+
+                        if show_sql == "Yes" and generated_sql:
+                            st.code(generated_sql, language="sql")
+
+                    render_feedback_controls(
+                        router_log_id=router_log_id if isinstance(router_log_id, int) else None,
+                        connection_params=connection_params,
                     )
-                if show_sql == "Yes" and generated_sql:
-                    st.sidebar.markdown("### Generated SQL")
-                    st.sidebar.code(generated_sql, language='sql')
+
+                    active_mode = "handled"
+
+            if active_mode == "chat":
+                with st.spinner("Thinking..."):
+                    try:
+                        answer = chat_with_memory(
+                            user_language=language,
+                            model_id=selected_model_id,
+                            connection_params=connection_params,
+                            messages=st.session_state.messages,
+                        )
+                    except Exception as err:
+                        answer = f"❌ Chat failed: {err}"
+
+                st.markdown(answer)
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "type": "text",
+                        "content": str(answer),
+                        "mode": "chat",
+                    }
+                )
+            elif active_mode == "sql":
+                with st.spinner("Running SQL..."):
+                    output, generated_sql = run_nl_sql(
+                        natural_language_statement=prompt,
+                        model_id=selected_model_id,
+                        connection_params=connection_params,
+                    )
+
+                render_and_store_sql_response(
+                    output=output,
+                    generated_sql=generated_sql,
+                    user_question=prompt,
+                    show_sql=show_sql,
+                    explain_result=explain_result,
+                    explain_threshold=explain_threshold,
+                    user_language=language,
+                    model_id=selected_model_id,
+                    connection_params=connection_params,
+                    message_mode="sql",
+                )
 
     add_footer()
+
 
 if __name__ == "__main__":
     main()
