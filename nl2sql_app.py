@@ -1,6 +1,7 @@
 import atexit
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import mysql.connector
@@ -20,7 +21,6 @@ DB_PASSWORD = "@Mysqlse2025"
 DEFAULT_DB_NAME = "airportdb"
 
 DB_NAME = DEFAULT_DB_NAME
-DBSYSTEM_SCHEMA = DB_NAME
 
 # -----------------------------------------------------------------------------
 # Model Configuration
@@ -41,11 +41,16 @@ default_model: Optional[str] = None
 MODEL_OPTIONS: List[str] = []
 restricted_models: List[str] = []
 
+DEFAULT_SMALL_MODEL_ID = "llama3.1-8b-instruct-v1"
+DEFAULT_MEDIUM_MODEL_ID = "meta.llama-3.2-90b-vision-instruct"
+DEFAULT_LARGE_MODEL_ID = "xai.grok-4-1-fast-reasoning"
+MODEL_PICKER_OPTIONS = ["Small", "Medium", "Large", "Catalog"]
+
 # -----------------------------------------------------------------------------
 # Router SQL bundle (externalized schema/tables/procedures/triggers)
 # -----------------------------------------------------------------------------
 
-ROUTER_SETUP_VERSION = "v4"
+ROUTER_SETUP_VERSION = "v5"
 ROUTER_SETUP_STATE_KEY = f"_smart_ask_ready_{ROUTER_SETUP_VERSION}"
 ROUTER_SQL_DIR = os.path.join(os.path.dirname(__file__), "sql", "router")
 ROUTER_SQL_PLAN: List[Tuple[str, str]] = [
@@ -77,6 +82,70 @@ def _cleanup_llm_clients() -> None:
         except Exception:
             pass
     _ACTIVE_LLM_CLIENTS.clear()
+
+
+# -----------------------------------------------------------------------------
+# Routing heuristics
+# -----------------------------------------------------------------------------
+
+
+_CONVERSATIONAL_MARKERS = [
+    "my name is",
+    "i am ",
+    "call me ",
+    "hello",
+    "hi",
+    "hey",
+    "how are you",
+    "who are you",
+    "what is your name",
+]
+
+_DB_INTENT_MARKERS = [
+    "database",
+    "schema",
+    "table",
+    "sql",
+    "query",
+    "show",
+    "list",
+    "count",
+    "sum",
+    "average",
+    "top",
+    "rows",
+    "data",
+]
+
+
+def is_conversational_prompt(user_question: str) -> bool:
+    normalized = " ".join(str(user_question or "").strip().lower().split())
+    if not normalized:
+        return True
+
+    has_conversation_marker = any(marker in normalized for marker in _CONVERSATIONAL_MARKERS)
+    has_db_intent_marker = any(marker in normalized for marker in _DB_INTENT_MARKERS)
+    return has_conversation_marker and not has_db_intent_marker
+
+
+def detect_schema_mentions(user_question: str, available_schemas: List[str]) -> List[str]:
+    question = str(user_question or "")
+    if not question:
+        return []
+
+    normalized_question = question.lower()
+    mentioned: List[str] = []
+    for schema in available_schemas:
+        schema_name = str(schema).strip()
+        if not schema_name:
+            continue
+
+        # Match whole schema tokens so "fifa" doesn't match unrelated words.
+        pattern = rf"(?<![a-z0-9_]){re.escape(schema_name.lower())}(?![a-z0-9_])"
+        if re.search(pattern, normalized_question):
+            mentioned.append(schema_name)
+
+    return mentioned
 
 
 # -----------------------------------------------------------------------------
@@ -382,6 +451,38 @@ def refresh_model_catalog(connection_params: Dict[str, Any]) -> None:
         restricted_models = []
 
 
+def _resolve_model_option(candidate: Optional[str], model_options: List[str]) -> Optional[str]:
+    requested = str(candidate or "").strip()
+    if not requested:
+        return None
+
+    if requested in model_options:
+        return requested
+
+    requested_lower = requested.lower()
+    for model_id in model_options:
+        if str(model_id).lower() == requested_lower:
+            return str(model_id)
+
+    return None
+
+
+def get_model_size_presets(model_options: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    configured_presets = {
+        "Small": str(_read_config_value("MODEL_PRESET_SMALL", DEFAULT_SMALL_MODEL_ID) or DEFAULT_SMALL_MODEL_ID),
+        "Medium": str(_read_config_value("MODEL_PRESET_MEDIUM", DEFAULT_MEDIUM_MODEL_ID) or DEFAULT_MEDIUM_MODEL_ID),
+        "Large": str(_read_config_value("MODEL_PRESET_LARGE", DEFAULT_LARGE_MODEL_ID) or DEFAULT_LARGE_MODEL_ID),
+    }
+
+    resolved_presets: Dict[str, str] = {}
+    for size_label, configured_model_id in configured_presets.items():
+        resolved_model_id = _resolve_model_option(configured_model_id, model_options)
+        if resolved_model_id:
+            resolved_presets[size_label] = resolved_model_id
+
+    return configured_presets, resolved_presets
+
+
 def _extract_generated_sql_from_nl_info_rows(rows: List[Tuple[Any, ...]], current_sql: str = "") -> str:
     generated_sql = current_sql
     for row in rows:
@@ -403,6 +504,7 @@ def run_nl_sql(
     natural_language_statement: str,
     model_id: str,
     connection_params: Dict[str, Any],
+    schema_scope: Optional[List[str]] = None,
 ) -> Tuple[Any, str]:
     """
     Execute NL_SQL and return:
@@ -414,9 +516,21 @@ def run_nl_sql(
     result_frames: List[pd.DataFrame] = []
 
     try:
+        # NL_SQL expects options.schemas as a JSON array of schema names.
+        cleaned_schema_scope: List[str] = []
+        for schema in schema_scope or []:
+            schema_name = str(schema).strip()
+            if schema_name and schema_name not in cleaned_schema_scope:
+                cleaned_schema_scope.append(schema_name)
+
+        if not cleaned_schema_scope:
+            fallback_schema = str(connection_params.get("database") or DB_NAME).strip()
+            if fallback_schema:
+                cleaned_schema_scope = [fallback_schema]
+
         options = json.dumps(
             {
-                "schemas": [DBSYSTEM_SCHEMA],
+                "schemas": cleaned_schema_scope,
                 "verbose": 1,
                 "model_id": model_id,
             }
@@ -489,7 +603,11 @@ def _extract_generated_sql_from_smart_ask_answer(answer: str) -> str:
     return str(parsed.get("generated_sql", "")).strip()
 
 
-def run_smart_ask(user_question: str, connection_params: Dict[str, Any]) -> Dict[str, Any]:
+def run_smart_ask(
+    user_question: str,
+    connection_params: Dict[str, Any],
+    schema_scope: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Call demo.smart_ask and return route, answer, generated SQL, and optional SQL table output."""
     cursor, conn = get_safe_cursor(connection_params)
     route = "LLM"
@@ -499,10 +617,22 @@ def run_smart_ask(user_question: str, connection_params: Dict[str, Any]) -> Dict
     result_frames: List[pd.DataFrame] = []
 
     try:
-        out_params = cursor.callproc("demo.smart_ask", (user_question, "", ""))
-        if len(out_params) >= 3:
-            route = str(out_params[1] or "LLM").strip().upper()
-            answer = str(out_params[2] or "").strip()
+        cleaned_schema_scope: List[str] = []
+        for schema in schema_scope or []:
+            schema_name = str(schema).strip()
+            if schema_name and schema_name not in cleaned_schema_scope:
+                cleaned_schema_scope.append(schema_name)
+
+        if not cleaned_schema_scope:
+            fallback_schema = str(connection_params.get("database") or DB_NAME).strip()
+            if fallback_schema:
+                cleaned_schema_scope = [fallback_schema]
+
+        schema_scope_json = json.dumps(cleaned_schema_scope)
+        out_params = cursor.callproc("demo.smart_ask", (user_question, schema_scope_json, "", ""))
+        if len(out_params) >= 4:
+            route = str(out_params[2] or "LLM").strip().upper()
+            answer = str(out_params[3] or "").strip()
 
         for stored_result in cursor.stored_results():
             rows = stored_result.fetchall()
@@ -864,7 +994,7 @@ def render_chat_message(message: Dict[str, Any], show_generated_sql: bool) -> No
 
 
 def main() -> None:
-    global DB_NAME, DBSYSTEM_SCHEMA
+    global DB_NAME
 
     st.title("Chat Assistant with NL2SQL")
 
@@ -896,23 +1026,86 @@ def main() -> None:
             fallback_schema = str(base_connection_params.get("database") or DEFAULT_DB_NAME)
             schema_list = [fallback_schema]
 
-        default_schema = DB_NAME if DB_NAME in schema_list else schema_list[0]
-        selected_schema = st.selectbox(
-            "Select database schema:",
-            schema_list,
-            index=schema_list.index(default_schema),
-        )
-        DB_NAME = selected_schema
-        DBSYSTEM_SCHEMA = selected_schema
+        configured_default_schema = str(base_connection_params.get("database") or "").strip()
+        if configured_default_schema in schema_list:
+            DB_NAME = configured_default_schema
+        else:
+            DB_NAME = schema_list[0]
 
-        connection_params = get_connection_params(selected_database=selected_schema)
+        sql_scope_state_key = "sql_schema_scope"
+        sql_scope_pending_additions_key = "sql_schema_scope_pending_additions"
+        pending_scope_additions_raw = st.session_state.pop(sql_scope_pending_additions_key, [])
+        pending_scope_additions: List[str] = []
+        if isinstance(pending_scope_additions_raw, list):
+            for schema in pending_scope_additions_raw:
+                schema_name = str(schema).strip()
+                if schema_name and schema_name in schema_list and schema_name not in pending_scope_additions:
+                    pending_scope_additions.append(schema_name)
+
+        existing_scope = st.session_state.get(sql_scope_state_key)
+        if not isinstance(existing_scope, list):
+            cleaned_scope = [DB_NAME]
+        else:
+            cleaned_scope = [
+                str(schema).strip()
+                for schema in existing_scope
+                if str(schema).strip() in schema_list
+            ]
+
+        if not cleaned_scope:
+            cleaned_scope = [DB_NAME]
+
+        for schema_name in pending_scope_additions:
+            if schema_name not in cleaned_scope:
+                cleaned_scope.append(schema_name)
+
+        st.session_state[sql_scope_state_key] = cleaned_scope
+
+        selected_sql_schemas = st.multiselect(
+            "Schemas for SQL inference (NL_SQL):",
+            schema_list,
+            key=sql_scope_state_key,
+            help="Choose one or more schemas to pass natively to sys.NL_SQL options.schemas.",
+        )
+        if not selected_sql_schemas:
+            selected_sql_schemas = [DB_NAME]
+            st.session_state[sql_scope_state_key] = selected_sql_schemas
+        st.caption(f"SQL schema scope: {len(selected_sql_schemas)} selected")
+
+        connection_params = get_connection_params(selected_database=DB_NAME)
 
         router_ready, router_error = ensure_smart_ask_objects(connection_params)
         if not router_ready and router_error:
             st.warning(f"`demo.smart_ask` unavailable: {router_error}")
 
-        default_index = MODEL_OPTIONS.index(default_model) if default_model in MODEL_OPTIONS else 0
-        selected_model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=default_index)
+        configured_presets, resolved_presets = get_model_size_presets(MODEL_OPTIONS)
+        picker_mode_default_index = MODEL_PICKER_OPTIONS.index("Catalog")
+        model_picker_mode = st.selectbox(
+            "Model Picker:",
+            MODEL_PICKER_OPTIONS,
+            index=picker_mode_default_index,
+            help=(
+                "Small/Medium/Large use preset model IDs. "
+                "You can override presets with MODEL_PRESET_SMALL, MODEL_PRESET_MEDIUM, and MODEL_PRESET_LARGE."
+            ),
+        )
+
+        if model_picker_mode == "Catalog":
+            default_index = MODEL_OPTIONS.index(default_model) if default_model in MODEL_OPTIONS else 0
+            selected_model_id = st.selectbox("Model List:", MODEL_OPTIONS, index=default_index)
+        else:
+            preset_model_id = resolved_presets.get(model_picker_mode)
+            if preset_model_id:
+                selected_model_id = preset_model_id
+                st.caption(f"{model_picker_mode} model: `{selected_model_id}`")
+            else:
+                fallback_model_id = default_model if default_model in MODEL_OPTIONS else MODEL_OPTIONS[0]
+                selected_model_id = fallback_model_id
+                configured_model_id = configured_presets.get(model_picker_mode, "(not configured)")
+                st.caption(
+                    f"{model_picker_mode} preset `{configured_model_id}` not available; "
+                    f"using `{selected_model_id}`."
+                )
 
         mode = st.selectbox("Mode", ["Auto", "Chat", "SQL"], index=0)
 
@@ -948,7 +1141,23 @@ def main() -> None:
     for msg in st.session_state.messages:
         render_chat_message(msg, show_generated_sql=(show_sql == "Yes"))
 
-    if prompt := st.chat_input("Ask your question..."):
+    pending_user_prompt_key = "pending_user_prompt"
+    sql_scope_pending_additions_key = "sql_schema_scope_pending_additions"
+    prompt = st.chat_input("Ask your question...")
+
+    if prompt:
+        mentioned_schemas = detect_schema_mentions(prompt, schema_list)
+        missing_schemas = [schema for schema in mentioned_schemas if schema not in selected_sql_schemas]
+        if missing_schemas:
+            st.session_state[sql_scope_pending_additions_key] = missing_schemas
+            st.session_state[pending_user_prompt_key] = prompt
+            st.rerun()
+    else:
+        pending_prompt = st.session_state.pop(pending_user_prompt_key, None)
+        if isinstance(pending_prompt, str) and pending_prompt.strip():
+            prompt = pending_prompt
+
+    if prompt:
         st.session_state.messages.append(
             {
                 "role": "user",
@@ -968,9 +1177,16 @@ def main() -> None:
                 if not router_ready:
                     st.caption("Auto router unavailable; falling back to CHAT mode.")
                     active_mode = "chat"
+                elif is_conversational_prompt(prompt):
+                    st.caption("Auto routed locally to `LLM` (conversational input).")
+                    active_mode = "chat"
                 else:
                     with st.spinner("Routing with demo.smart_ask..."):
-                        router_output = run_smart_ask(prompt, connection_params)
+                        router_output = run_smart_ask(
+                            prompt,
+                            connection_params,
+                            schema_scope=selected_sql_schemas,
+                        )
 
                     router_route = str(router_output.get("route", "LLM")).upper()
                     router_answer = str(router_output.get("answer", "")).strip()
@@ -1058,6 +1274,7 @@ def main() -> None:
                         natural_language_statement=prompt,
                         model_id=selected_model_id,
                         connection_params=connection_params,
+                        schema_scope=selected_sql_schemas,
                     )
 
                 render_and_store_sql_response(
