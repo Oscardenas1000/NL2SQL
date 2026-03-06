@@ -1,5 +1,6 @@
 CREATE PROCEDURE demo.smart_ask(
     IN  p_question  VARCHAR(2000),
+    IN  p_schema_scope_json LONGTEXT,
     OUT p_route     VARCHAR(20),
     OUT p_answer    LONGTEXT
 )
@@ -17,6 +18,9 @@ main_block: BEGIN
     DECLARE v_sql_query TEXT DEFAULT NULL;
     DECLARE v_rag_text LONGTEXT DEFAULT '';
     DECLARE v_schema_context LONGTEXT DEFAULT '';
+    DECLARE v_schema_scope_json JSON DEFAULT NULL;
+    DECLARE v_scope_signature TEXT DEFAULT '*';
+    DECLARE v_nl_sql_options JSON;
 
     DECLARE v_log_id INT UNSIGNED DEFAULT NULL;
     DECLARE v_normalized_question TEXT;
@@ -30,7 +34,20 @@ main_block: BEGIN
     SET @smart_ask_log_id = NULL;
 
     SET v_normalized_question = LOWER(TRIM(REGEXP_REPLACE(p_question, '[[:space:]]+', ' ')));
-    SET v_question_hash = SHA2(v_normalized_question, 256);
+
+    IF p_schema_scope_json IS NOT NULL AND JSON_VALID(p_schema_scope_json) THEN
+        SET v_schema_scope_json = CAST(p_schema_scope_json AS JSON);
+    END IF;
+
+    IF v_schema_scope_json IS NULL OR JSON_LENGTH(v_schema_scope_json) = 0 THEN
+        SET v_scope_signature = '*';
+        SET v_nl_sql_options = JSON_OBJECT('verbose', 1);
+    ELSE
+        SET v_scope_signature = CAST(v_schema_scope_json AS CHAR(4096));
+        SET v_nl_sql_options = JSON_OBJECT('schemas', v_schema_scope_json, 'verbose', 1);
+    END IF;
+
+    SET v_question_hash = SHA2(CONCAT(v_normalized_question, '||scope=', v_scope_signature), 256);
 
     SELECT c.id, c.route, c.answer, c.generated_sql
       INTO v_cached_id, v_cached_route, v_cached_answer, v_cached_sql
@@ -59,7 +76,7 @@ main_block: BEGIN
             0,
             1,
             v_cached_sql,
-            'Served from ai_router_cache',
+            CONCAT('Served from ai_router_cache (scope=', v_scope_signature, ')'),
             NOW()
         );
         SET v_log_id = LAST_INSERT_ID();
@@ -88,13 +105,20 @@ main_block: BEGIN
                12000
            )
       INTO v_schema_context
-      FROM demo.router_schema_hints AS h;
+      FROM demo.router_schema_hints AS h
+     WHERE (
+        v_schema_scope_json IS NULL
+        OR JSON_LENGTH(v_schema_scope_json) = 0
+        OR JSON_CONTAINS(v_schema_scope_json, JSON_QUOTE(h.schema_name), '$')
+    );
 
     SET v_classify = sys.ML_GENERATE(
         CONCAT(
             'Classify this question into exactly one of SQL, RAG, or LLM. ',
             'Return format: ROUTE=<SQL|RAG|LLM>;CONFIDENCE=<0-100>. ',
             'Prefer SQL when answer likely exists in relational tables. ',
+            'If the user asks about database contents, available records, or table data, choose SQL. ',
+            'Choose LLM for greetings, introductions, opinions, or other conversational prompts that do not ask for stored data. ',
             'Schema context: ', COALESCE(v_schema_context, 'none'), '. ',
             'Question: ', p_question
         ),
@@ -142,7 +166,7 @@ main_block: BEGIN
     SET @smart_ask_log_id = v_log_id;
 
     IF v_ambiguous = 1 THEN
-        CALL sys.NL_SQL(p_question, @smart_ask_nl_meta, @smart_ask_nl_unused);
+        CALL sys.NL_SQL(p_question, @smart_ask_nl_meta, v_nl_sql_options);
         SET v_sql_valid = CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_nl_meta, '$.is_sql_valid')), '0') AS UNSIGNED);
         SET v_sql_query = JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_nl_meta, '$.sql_query'));
 
@@ -173,7 +197,7 @@ main_block: BEGIN
          WHERE id = v_log_id;
 
     ELSEIF v_route = 'SQL' THEN
-        CALL sys.NL_SQL(p_question, @smart_ask_nl_meta, @smart_ask_nl_unused);
+        CALL sys.NL_SQL(p_question, @smart_ask_nl_meta, v_nl_sql_options);
 
         SET v_sql_valid = CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_nl_meta, '$.is_sql_valid')), '0') AS UNSIGNED);
         SET v_sql_query = JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_nl_meta, '$.sql_query'));
