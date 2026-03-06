@@ -14,7 +14,7 @@ from heatwave_llm import HeatWaveLLM
 # Configuration
 # -----------------------------------------------------------------------------
 
-DEFAULT_DB_HOST = "255.255.255.255"
+DEFAULT_DB_HOST = "163.192.105.216"
 DEFAULT_DB_PORT = 3306
 DEFAULT_DB_USER = "admin"
 DB_PASSWORD = "@Mysqlse2025"
@@ -30,16 +30,11 @@ MODEL_CATALOG_QUERY = (
     "SELECT * FROM sys.ML_SUPPORTED_LLMS "
     "ORDER BY availability_date DESC;"
 )
-GENERATION_MODELS_QUERY = (
-    "SELECT * "
-    "FROM sys.ML_SUPPORTED_LLMS "
-    "WHERE JSON_CONTAINS(capabilities, '\"GENERATION\"') "
-    "ORDER BY availability_date DESC;"
-)
 
 default_model: Optional[str] = None
 MODEL_OPTIONS: List[str] = []
 restricted_models: List[str] = []
+MODEL_CATALOG_ERROR: Optional[str] = None
 
 DEFAULT_SMALL_MODEL_ID = "llama3.1-8b-instruct-v1"
 DEFAULT_MEDIUM_MODEL_ID = "meta.llama-3.2-90b-vision-instruct"
@@ -146,6 +141,17 @@ def detect_schema_mentions(user_question: str, available_schemas: List[str]) -> 
             mentioned.append(schema_name)
 
     return mentioned
+
+
+def safe_rerun() -> None:
+    rerun_fn = getattr(st, "rerun", None)
+    if callable(rerun_fn):
+        rerun_fn()
+        return
+
+    experimental_rerun_fn = getattr(st, "experimental_rerun", None)
+    if callable(experimental_rerun_fn):
+        experimental_rerun_fn()
 
 
 # -----------------------------------------------------------------------------
@@ -289,6 +295,21 @@ def _read_router_sql_file(filename: str) -> str:
         return handle.read()
 
 
+def _smart_ask_has_schema_scope_param(cursor: mysql.connector.cursor.MySQLCursor) -> bool:
+    cursor.execute(
+        (
+            "SELECT COUNT(*) "
+            "FROM information_schema.parameters "
+            "WHERE specific_schema = 'demo' "
+            "AND specific_name = 'smart_ask' "
+            "AND parameter_mode = 'IN' "
+            "AND parameter_name = 'p_schema_scope_json'"
+        )
+    )
+    row = cursor.fetchone()
+    return bool(row and int(row[0]) > 0)
+
+
 def _column_exists(
     cursor: mysql.connector.cursor.MySQLCursor,
     schema_name: str,
@@ -383,7 +404,10 @@ def apply_router_sql_bundle(connection_params: Dict[str, Any]) -> Tuple[bool, Op
     try:
         if st.session_state.get(ROUTER_SETUP_STATE_KEY):
             _ensure_router_log_columns(cursor)
-            return True, None
+            if _smart_ask_has_schema_scope_param(cursor):
+                return True, None
+            # Force one-time routine refresh if an older smart_ask signature is still present.
+            st.session_state[ROUTER_SETUP_STATE_KEY] = False
 
         for filename, mode in ROUTER_SQL_PLAN:
             sql_text = _read_router_sql_file(filename)
@@ -416,27 +440,67 @@ def apply_router_sql_bundle(connection_params: Dict[str, Any]) -> Tuple[bool, Op
 # -----------------------------------------------------------------------------
 
 
+def _capabilities_include_generation(capabilities: Any) -> bool:
+    if capabilities is None:
+        return False
+
+    parsed: Any = capabilities
+    if isinstance(parsed, str):
+        text_value = parsed.strip()
+        if not text_value:
+            return False
+        try:
+            parsed = json.loads(text_value)
+        except json.JSONDecodeError:
+            parsed = text_value
+
+    if isinstance(parsed, dict):
+        values = list(parsed.values())
+    elif isinstance(parsed, (list, tuple, set)):
+        values = list(parsed)
+    else:
+        values = [parsed]
+
+    for value in values:
+        token = str(value).strip().upper()
+        if token == "GENERATION" or "GENERATION" in token:
+            return True
+
+    return False
+
+
 def refresh_model_catalog(connection_params: Dict[str, Any]) -> None:
     """Refresh model options and restricted models from the system catalog."""
-    global MODEL_OPTIONS, restricted_models, default_model
+    global MODEL_OPTIONS, restricted_models, default_model, MODEL_CATALOG_ERROR
     try:
         catalog_df = execute_sql(MODEL_CATALOG_QUERY, connection_params)
-        generation_df = execute_sql(GENERATION_MODELS_QUERY, connection_params)
-    except Exception:
+        MODEL_CATALOG_ERROR = None
+    except Exception as err:
         MODEL_OPTIONS = []
         restricted_models = []
         default_model = None
+        MODEL_CATALOG_ERROR = str(err)
         return
 
-    MODEL_OPTIONS = (
-        generation_df["model_id"].dropna().astype(str).tolist()
-        if "model_id" in generation_df.columns
-        else []
-    )
+    if "model_id" in catalog_df.columns:
+        all_model_ids = catalog_df["model_id"].dropna().astype(str).tolist()
+    else:
+        all_model_ids = []
 
-    if "default_model" in generation_df.columns and "model_id" in generation_df.columns:
-        defaults = generation_df[generation_df["default_model"] == 1]["model_id"].dropna().astype(str).tolist()
-        default_model = defaults[0] if defaults else (MODEL_OPTIONS[0] if MODEL_OPTIONS else None)
+    generation_model_ids: List[str] = []
+    if "model_id" in catalog_df.columns and "capabilities" in catalog_df.columns:
+        generation_df = catalog_df[catalog_df["capabilities"].apply(_capabilities_include_generation)]
+        generation_model_ids = generation_df["model_id"].dropna().astype(str).tolist()
+
+    MODEL_OPTIONS = generation_model_ids if generation_model_ids else all_model_ids
+
+    if "default_model" in catalog_df.columns and "model_id" in catalog_df.columns:
+        defaults = catalog_df[catalog_df["default_model"] == 1]["model_id"].dropna().astype(str).tolist()
+        if defaults:
+            default_candidate = defaults[0]
+            default_model = default_candidate if default_candidate in MODEL_OPTIONS else (MODEL_OPTIONS[0] if MODEL_OPTIONS else None)
+        else:
+            default_model = MODEL_OPTIONS[0] if MODEL_OPTIONS else None
     else:
         default_model = MODEL_OPTIONS[0] if MODEL_OPTIONS else None
 
@@ -1013,7 +1077,10 @@ def main() -> None:
     with st.sidebar:
         refresh_model_catalog(base_connection_params)
         if not MODEL_OPTIONS:
-            st.error("No generation-capable models found in sys.ML_SUPPORTED_LLMS.")
+            if MODEL_CATALOG_ERROR:
+                st.error(f"Model catalog query failed: {MODEL_CATALOG_ERROR}")
+            else:
+                st.error("No models found in sys.ML_SUPPORTED_LLMS.")
             st.stop()
 
         try:
@@ -1151,7 +1218,7 @@ def main() -> None:
         if missing_schemas:
             st.session_state[sql_scope_pending_additions_key] = missing_schemas
             st.session_state[pending_user_prompt_key] = prompt
-            st.rerun()
+            safe_rerun()
     else:
         pending_prompt = st.session_state.pop(pending_user_prompt_key, None)
         if isinstance(pending_prompt, str) and pending_prompt.strip():
