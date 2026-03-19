@@ -1,305 +1,136 @@
 # NL2SQL
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-This repository contains a minimal Streamlit application for querying an Oracle HeatWave instance using natural language. The app relies on a large language model (LLM) to translate user prompts into SQL queries.
+This repository contains a Streamlit app for querying an Oracle HeatWave instance with natural language. The app supports three modes:
+
+- `Auto`: routes each prompt through `demo.smart_ask` when the router bundle is available
+- `Chat`: uses `sys.ML_GENERATE` for conversational responses with memory
+- `SQL`: uses `sys.NL_SQL` to generate and execute SQL against selected schemas
+
+The app also supports optional result explanations, schema scoping, and thumbs up/down feedback for router outputs.
 
 ---
 
 ## Requirements
 
-### VCN Requirements
+### Network
 
-Before starting the deployment, ensure the following networking setup is in place:
+- The VCN should include at least one public subnet and one private subnet.
+- The HeatWave database must be reachable from the app host on the configured MySQL port.
+- The app is served on port `8501`, so that port must be open to the browser clients that need access.
 
-- The **VCN (Virtual Cloud Network)** must include **at least two subnets**:
-  - One **public subnet**
-  - One **private subnet**
-- The **private subnet** must have the following ports **open to HeatWave**:
-  - `3306` (classic MySQL)
-  - `33060` (MySQL X Protocol)
-    - ℹ️ *If your HeatWave system uses custom ports, ensure these are used consistently throughout the deployment process.*
-- The **public subnet** must have **port `8501` open to the internet** to allow public access to the app.
+### Host
+
+- RHEL 8 or newer is recommended for the bootstrap scripts.
+- The app host must be able to reach the HeatWave instance and, if you use the setup scripts, the internet for package installation.
 
 ---
 
-### Virtual Machine Requirements
+## Setup
 
-Ensure that your Virtual Machine (VM) meets the following conditions:
+### Install dependencies
 
-- **Operating System**: RHEL 8 or newer
-- **Network Placement**: The VM **must reside in the same VCN** as the pre-configured HeatWave DB system.
-- **Internet Connectivity**:
-  - If the VM is in a **public subnet**, it must be accessible via its public IP.
-  - If deployed in a **private subnet**, it must still have **outbound internet access** (e.g., via a NAT gateway).
-
----
-
-## OS Setup Instructions
-
-### Downloading the Repository
-
-To download this repository directly, use the following command:
+From the repository root:
 
 ```bash
-wget https://github.com/Oscardenas1000/NL2SQL/archive/refs/heads/main.zip
+pip install -r requirements.txt
 ```
 
-Once the download is complete, unzip the file:
+### Optional OS bootstrap
 
-```bash
-unzip main.zip
-```
-
-Navigate into the extracted project directory:
-
-```bash
-cd NL2SQL-main
-```
-
-### Running the Setup Script
-
-This repository includes an executable setup script named `setup.sh`.
-
-To make it executable, run:
+The `setup.sh` script is intended for RHEL / Oracle Linux hosts. It installs the basic Python and Streamlit runtime, then opens port `8501` in `firewalld`.
 
 ```bash
 chmod +x setup.sh
-```
-
-Then execute the script:
-
-```bash
 ./setup.sh
 ```
 
-### Running OCI CLI Setup Script
+### Optional OCI CLI helper
 
-To make the script executable, run:
+The `oci_cli_setup.sh` helper assumes the OCI CLI is installed and available as `oci`. It bootstraps the local OCI config if needed, then walks through the HeatWave connection setup and writes the app connection settings to `.streamlit/secrets.toml` in the repository root.
 
 ```bash
 chmod +x oci_cli_setup.sh
-```
-
-Then execute it:
-
-```bash
 ./oci_cli_setup.sh
 ```
 
-Proceed through the OCI CLI setup by providing the following:
-
-- `User OCID`
-- `Tenancy OCID`
-- `Region`
-
-Then provide a path and filename for your OCI CLI configuration file, along with the public and private API keys.
-
-To finalize setup, follow the official Oracle documentation here:
-[Signing Requests with API Key](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#How2) to ensure your API keys are properly configured.
-
-To complete the deployment, supply your `HeatWave_OCID` and credentials so they can be automatically embedded into the app's `.py` file.
+If you use the OCI helper, follow Oracle's API key documentation:
+[Signing Requests with API Key](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#How2)
 
 ---
 
-## Environment Variables
+## Configuration
 
-The app expects the following environment variables to be defined:
+The app reads connection settings from environment variables first and falls back to Streamlit secrets when available. If you use `oci_cli_setup.sh`, it writes the database keys below to `.streamlit/secrets.toml`.
 
-* `HW_HOST` – hostname of the HeatWave service
-* `HW_DB_USER` – database user name
-* `HW_DB_PASS` – database password
-* `HW_DB_NAME` – database schema to use
-* `MODEL_ID` – HeatWave GenAI Model ID
+Required database variables:
+
+- `DB_HOST` - HeatWave host name or IP address
+- `DB_PORT` - MySQL port, usually `3306`
+- `DB_USER` - database user name
+- `DB_PASSWORD` - database password
+- `DB_NAME` - default schema name
+
+Optional model preset overrides:
+
+- `MODEL_PRESET_SMALL`
+- `MODEL_PRESET_MEDIUM`
+- `MODEL_PRESET_LARGE`
+
+If the model preset variables are unset, the app uses built-in defaults and resolves them against `sys.ML_SUPPORTED_LLMS` in the database catalog.
 
 ---
 
-## Running the App
+## Run
 
-Start the Streamlit server with:
+Start the app with:
 
 ```bash
 streamlit run nl2sql_app.py
 ```
 
-Enter a natural language query, and the app will display the generated SQL
-statement and the query results from HeatWave.
+The sidebar loads available models from `sys.ML_SUPPORTED_LLMS`, lets you choose a model preset or catalog entry, and lets you pick one or more schemas for `SQL` inference.
 
 ---
 
-## Example Usage
+## Runtime Behavior
 
-1. Edit the configuration variables at the top of `nl2sql_app.py` to match your HeatWave credentials.
+- `Auto` mode routes database-oriented prompts through `demo.smart_ask` when the router bundle is available, and falls back to `Chat` for conversational input or when the router objects are unavailable.
+- `Chat` mode sends the conversation history to `sys.ML_GENERATE`.
+- `SQL` mode sends the prompt to `sys.NL_SQL` and renders the result table when one is returned.
+- If `Explain result in natural language` is enabled, the app explains small SQL result sets with `sys.ML_GENERATE`.
+- When `Show generated SQL?` is enabled, the UI prints the generated SQL below the result.
+- The router bundle in `sql/router/` creates the `demo` schema objects used for caching, route metrics, schema hints, and feedback.
 
-2. Launch the app:
-
-   ```bash
-   streamlit run nl2sql_app.py
-   ```
-
-3. When the browser opens, type a question about your data, for example:
-
-   ```text
-   Which airlines operate flights from SFO to JFK?
-   ```
-
-The app will generate a SQL query, execute it, and display the results.
-If the query returns fewer than 25 rows, a short natural language summary
-is also shown.
+The current flow is summarized in [docs/app_flowchart.md](/Users/oscarden/Desktop/AutoML/NL2SQL/docs/app_flowchart.md) and illustrated by [resources/diagram.svg](/Users/oscarden/Desktop/AutoML/NL2SQL/resources/diagram.svg).
 
 ---
 
 ## Database Requirements
 
-The app works at the **database/schema** level.
-It queries into the selected schema and pulls metadata like table names,
-column names, column types, **and a required column comment** that explains
-why each column is important.
+The app works at the database/schema level. It queries the selected schema and uses table and column metadata, including column comments, to improve SQL generation.
 
----
+If your schema does not already include useful comments, add them before using `SQL` mode. The app is much more reliable when columns have concise descriptions.
 
-### Example Table Definition
+### Example table definition
 
-| TABLE\_NAME    | COLUMN\_NAME  | COLUMN\_TYPE       | COLUMN\_COMMENT                                                                                                    |
-| -------------- | ------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| airline        | airline\_id   | smallint           | Unique identifier for each airline.                                                                                |
-| airline        | iata          | char(2)            | Two-character IATA code assigned to the airline, used globally for identification.                                 |
-| airline        | airlinename   | varchar(30)        | The full name of the airline.                                                                                      |
-| airline        | base\_airport | smallint           | ID of the base airport for the airline, referring to the primary operational hub.                                  |
-| airplane       | airplane\_id  | int                | Unique identifier for each airplane. This is the primary key and is auto-incremented.                              |
-| airplane       | capacity      | mediumint unsigned | Maximum number of passengers that the airplane can accommodate.                                                    |
-| airplane       | type\_id      | int                | Identifier for the airplane model/type. This is a foreign key referencing the airplane\_type table.                |
-| airplane       | airline\_id   | int                | Identifier of the airline that owns or operates the airplane. This is a foreign key referencing the airline table. |
-| airplane\_type | type\_id      | int                | Unique identifier for each airplane type or model.                                                                 |
-| airplane\_type | identifier    | varchar(50)        | Model identifier or code for the airplane type.                                                                    |
-| airplane\_type | description   | text               | Additional details or specifications about the airplane type.                                                      |
-| airport        | airport\_id   | smallint           | Unique identifier for each airport.                                                                                |
+| TABLE_NAME | COLUMN_NAME | COLUMN_TYPE | COLUMN_COMMENT |
+| --- | --- | --- | --- |
+| airline | airline_id | smallint | Unique identifier for each airline. |
+| airline | iata | char(2) | Two-character IATA code assigned to the airline. |
+| airline | airlinename | varchar(30) | The full name of the airline. |
 
----
-
-## How to Add Column Comments in MySQL
-
-If your table doesn’t have column comments yet, follow these steps.
-
----
-
-### 1️⃣ Check Your Table
-
-Check the current structure and see which columns lack comments:
-
-```sql
-SHOW FULL COLUMNS FROM your_table_name;
-```
-
-This will display a `Comment` column at the end.
-
----
-
-### 2️⃣ Add Comments to Existing Columns
-
-In MySQL, you **must** modify the column definition to add a comment.
-You cannot just attach a comment separately.
-
-Use this syntax:
+### Adding column comments
 
 ```sql
 ALTER TABLE your_table_name
 MODIFY COLUMN column_name column_definition COMMENT 'Your comment here';
 ```
 
-⚠️ **Important**: You must re-specify the full column definition (type,
-NULL/NOT NULL, keys, etc.) — otherwise MySQL will throw an error.
+Use `SHOW FULL COLUMNS FROM your_table_name;` to verify the comments.
 
 ---
 
-### Example
+## License
 
-Given this table:
-
-```sql
-CREATE TABLE employees (
-    employee_id INT PRIMARY KEY,
-    name VARCHAR(100),
-    hire_date DATE
-);
-```
-
-To add comments:
-
-* Add to `employee_id`:
-
-  ```sql
-  ALTER TABLE employees
-  MODIFY COLUMN employee_id INT PRIMARY KEY COMMENT 'Unique identifier for each employee';
-  ```
-
-* Add to `name`:
-
-  ```sql
-  ALTER TABLE employees
-  MODIFY COLUMN name VARCHAR(100) COMMENT 'Full name of the employee';
-  ```
-
-* Add to `hire_date`:
-
-  ```sql
-  ALTER TABLE employees
-  MODIFY COLUMN hire_date DATE COMMENT 'The date the employee was hired';
-  ```
-
----
-
-### 3️⃣ Verify the Changes
-
-Run:
-
-```sql
-SHOW FULL COLUMNS FROM employees;
-```
-
-You should now see your comments listed.
-
----
-
-## How the App works:
-The flowchart below outlines the full workflow of how natural language queries (in any language) are processed and transformed into SQL queries to retrieve data from a database.
-<img src="resources/diagram.svg" alt="App Flow Diagram" width="100%"/>
-
-### Step-by-Step Explanation
-
-1. **Input in Natural Language (NL)**
-   The user submits a question in natural language, possibly in any language, such as:
-   `¿Cuáles son los productos más vendidos?`
-
-2. **Retrieve Schema Information**
-   The system first executes:
-   ```sql
-   SELECT * FROM information_schema.tables
-   ```
-   to discover all available tables in the database. This ensures the system knows which data sources it can query.
-
-3. **Check Input Language**
-   The system determines if the query is already in English:
-   - If yes → Proceeds to generate SQL.
-   - If not → Translates it into English using a translation engine.
-
-4. **Generate SQL Code**
-   Based on the now-English input and known schema, the app generates a raw SQL query matching the user's intent.
-
-5. **Clean Up SQL Code**
-   The raw SQL is cleaned or adjusted to:
-   - Fix structural issues.
-   - Improve compatibility with the actual database schema.
-
-6. **Execute the SQL Code**
-   The cleaned SQL query is run against the database.
-
-7. **Check Execution Result:**
-   - If the query fails (due to auto-generated syntax or schema issues):  
-     The procedure tries to self-correct the query for multiple times.
-   - If the query succeeds:
-     - If the result has fewer than 24 rows, it is translated back into natural language and returned to the user in sentence form.
-     - If the result has 24 rows or more, it is shown as a tabular output.
-
-## LICENSE
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See [LICENSE](/Users/oscarden/Desktop/AutoML/NL2SQL/LICENSE) for details.
