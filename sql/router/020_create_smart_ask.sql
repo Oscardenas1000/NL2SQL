@@ -21,6 +21,7 @@ main_block: BEGIN
     DECLARE v_schema_scope_json JSON DEFAULT NULL;
     DECLARE v_scope_signature TEXT DEFAULT '*';
     DECLARE v_nl_sql_options JSON;
+    DECLARE v_rag_options JSON;
 
     DECLARE v_log_id INT UNSIGNED DEFAULT NULL;
     DECLARE v_normalized_question TEXT;
@@ -42,9 +43,11 @@ main_block: BEGIN
     IF v_schema_scope_json IS NULL OR JSON_LENGTH(v_schema_scope_json) = 0 THEN
         SET v_scope_signature = '*';
         SET v_nl_sql_options = JSON_OBJECT('verbose', 1);
+        SET v_rag_options = JSON_OBJECT();
     ELSE
         SET v_scope_signature = CAST(v_schema_scope_json AS CHAR(4096));
         SET v_nl_sql_options = JSON_OBJECT('schemas', v_schema_scope_json, 'verbose', 1);
+        SET v_rag_options = JSON_OBJECT('schema', v_schema_scope_json);
     END IF;
 
     SET v_question_hash = SHA2(CONCAT(v_normalized_question, '||scope=', v_scope_signature), 256);
@@ -170,7 +173,7 @@ main_block: BEGIN
         SET v_sql_valid = CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_nl_meta, '$.is_sql_valid')), '0') AS UNSIGNED);
         SET v_sql_query = JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_nl_meta, '$.sql_query'));
 
-        CALL sys.ML_RAG(p_question, @smart_ask_rag_resp, NULL);
+        CALL sys.ML_RAG(p_question, @smart_ask_rag_resp, v_rag_options);
         SET v_rag_text = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_rag_resp, '$.text')), '');
 
         SET v_route = 'FUSION';
@@ -235,7 +238,7 @@ main_block: BEGIN
 
     ELSEIF v_route = 'RAG' THEN
         SET p_route = 'RAG';
-        CALL sys.ML_RAG(p_question, @smart_ask_rag_resp, NULL);
+        CALL sys.ML_RAG(p_question, @smart_ask_rag_resp, v_rag_options);
         SET p_answer = JSON_UNQUOTE(JSON_EXTRACT(@smart_ask_rag_resp, '$.text'));
 
         UPDATE demo.ai_router_log

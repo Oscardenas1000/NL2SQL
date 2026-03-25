@@ -18,7 +18,8 @@ Compatibility note:
 
 - Confidence scoring: `demo.smart_ask` stores `route_confidence` and `ambiguity_flag`.
 - Schema-aware routing: `demo.router_schema_hints` + `demo.refresh_router_schema_hints`.
-- Multi-route fusion: low-confidence branch in `demo.smart_ask` runs `NL_SQL` + `ML_RAG` and synthesizes via `ML_GENERATE`.
+- Schema-scoped RAG: `demo.smart_ask` passes the selected schema JSON into `sys.ML_RAG` via `options.schema`.
+- Multi-route fusion: low-confidence branch in `demo.smart_ask` runs `NL_SQL` + scoped `ML_RAG` and synthesizes via `ML_GENERATE`.
 - Response caching: `demo.ai_router_cache` used by `demo.smart_ask`.
 - User feedback loop: `demo.ai_router_feedback`, `demo.submit_router_feedback`, and route metrics trigger.
 

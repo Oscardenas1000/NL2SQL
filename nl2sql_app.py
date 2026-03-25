@@ -10,6 +10,14 @@ import streamlit as st
 
 from heatwave_llm import HeatWaveLLM
 
+try:
+    from langchain_core.chat_history import InMemoryChatMessageHistory
+    from langchain_core.messages import AIMessage, HumanMessage
+except Exception:
+    InMemoryChatMessageHistory = None
+    AIMessage = None
+    HumanMessage = None
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -45,7 +53,7 @@ MODEL_PICKER_OPTIONS = ["Small", "Medium", "Large", "Catalog"]
 # Router SQL bundle (externalized schema/tables/procedures/triggers)
 # -----------------------------------------------------------------------------
 
-ROUTER_SETUP_VERSION = "v5"
+ROUTER_SETUP_VERSION = "v6"
 ROUTER_SETUP_STATE_KEY = f"_smart_ask_ready_{ROUTER_SETUP_VERSION}"
 ROUTER_SQL_DIR = os.path.join(os.path.dirname(__file__), "sql", "router")
 ROUTER_SQL_PLAN: List[Tuple[str, str]] = [
@@ -282,6 +290,45 @@ def execute_sql(
         return pd.DataFrame(rows, columns=cols)
     finally:
         safe_close_cursor_conn(cursor, conn)
+
+
+def normalize_schema_scope(
+    schema_scope: Optional[List[str]],
+    fallback_schema: Optional[str] = None,
+) -> List[str]:
+    cleaned_scope: List[str] = []
+    for schema in schema_scope or []:
+        schema_name = str(schema).strip()
+        if schema_name and schema_name not in cleaned_scope:
+            cleaned_scope.append(schema_name)
+
+    fallback = str(fallback_schema or "").strip()
+    if not cleaned_scope and fallback:
+        cleaned_scope = [fallback]
+
+    return cleaned_scope
+
+
+def parse_json_payload(raw_payload: Any) -> Any:
+    if raw_payload is None:
+        return None
+
+    if isinstance(raw_payload, (dict, list)):
+        return raw_payload
+
+    if isinstance(raw_payload, bytes):
+        raw_payload = raw_payload.decode("utf-8", errors="replace")
+
+    if isinstance(raw_payload, str):
+        stripped_payload = raw_payload.strip()
+        if not stripped_payload:
+            return None
+        try:
+            return json.loads(stripped_payload)
+        except json.JSONDecodeError:
+            return stripped_payload
+
+    return raw_payload
 
 
 # -----------------------------------------------------------------------------
@@ -581,16 +628,10 @@ def run_nl_sql(
 
     try:
         # NL_SQL expects options.schemas as a JSON array of schema names.
-        cleaned_schema_scope: List[str] = []
-        for schema in schema_scope or []:
-            schema_name = str(schema).strip()
-            if schema_name and schema_name not in cleaned_schema_scope:
-                cleaned_schema_scope.append(schema_name)
-
-        if not cleaned_schema_scope:
-            fallback_schema = str(connection_params.get("database") or DB_NAME).strip()
-            if fallback_schema:
-                cleaned_schema_scope = [fallback_schema]
+        cleaned_schema_scope = normalize_schema_scope(
+            schema_scope,
+            fallback_schema=str(connection_params.get("database") or DB_NAME).strip(),
+        )
 
         options = json.dumps(
             {
@@ -647,6 +688,166 @@ def run_nl_sql(
         safe_close_cursor_conn(cursor, conn)
 
 
+def discover_rag_vector_stores(
+    connection_params: Dict[str, Any],
+    schema_scope: Optional[List[str]] = None,
+) -> Tuple[List[str], Optional[str]]:
+    """Return HeatWave-discoverable vector stores for the selected schemas."""
+    cleaned_schema_scope = normalize_schema_scope(
+        schema_scope,
+        fallback_schema=str(connection_params.get("database") or DB_NAME).strip(),
+    )
+
+    discovery_options = json.dumps({"schema": cleaned_schema_scope})
+    cursor, conn = get_safe_cursor(connection_params)
+    try:
+        cursor.execute("SET @rag_vector_store_options = %s", (discovery_options,))
+        cursor.execute("CALL sys.ML_RETRIEVE_VECTOR_TABLES(@rag_vector_store_options, @rag_vector_store_list)")
+
+        for stored_result in cursor.stored_results():
+            try:
+                stored_result.close()
+            except Exception:
+                pass
+
+        cursor.execute("SELECT @rag_vector_store_list")
+        row = cursor.fetchone()
+        raw_vector_store_list = row[0] if row else None
+        parsed_vector_store_list = parse_json_payload(raw_vector_store_list)
+
+        vector_stores: List[str] = []
+        if isinstance(parsed_vector_store_list, list):
+            for table_name in parsed_vector_store_list:
+                cleaned_table_name = str(table_name or "").strip()
+                if cleaned_table_name and cleaned_table_name not in vector_stores:
+                    vector_stores.append(cleaned_table_name)
+        elif isinstance(parsed_vector_store_list, str):
+            cleaned_table_name = parsed_vector_store_list.strip()
+            if cleaned_table_name:
+                vector_stores.append(cleaned_table_name)
+
+        return vector_stores, None
+    except mysql.connector.Error as err:
+        return [], str(err)
+    finally:
+        safe_close_cursor_conn(cursor, conn)
+
+
+def build_rag_prompt(
+    user_question: str,
+    user_language: str,
+    messages: List[Dict[str, Any]],
+    extra_context: Optional[str] = None,
+) -> str:
+    history_text = format_recent_turns(messages, max_turns=12)
+
+    prompt_sections = [
+        "You are a retrieval-augmented assistant for relational database questions.",
+        "Use the retrieved context to answer the latest Human message directly.",
+        "If the retrieved context is insufficient, say that the selected schemas do not provide enough information.",
+        f"Respond in language code '{user_language}'.",
+    ]
+
+    if history_text:
+        prompt_sections.append(f"Conversation:\n{history_text}")
+
+    if extra_context:
+        prompt_sections.append(
+            "Additional app context (supporting only, do not echo verbatim):\n"
+            f"{extra_context}"
+        )
+
+    prompt_sections.append(f"Latest Human question:\n{user_question}")
+    return "\n\n".join(prompt_sections)
+
+
+def run_ml_rag(
+    user_question: str,
+    model_id: str,
+    connection_params: Dict[str, Any],
+    schema_scope: Optional[List[str]],
+    user_language: str,
+    messages: List[Dict[str, Any]],
+    extra_context: Optional[str] = None,
+) -> Dict[str, Any]:
+    cleaned_schema_scope = normalize_schema_scope(
+        schema_scope,
+        fallback_schema=str(connection_params.get("database") or DB_NAME).strip(),
+    )
+
+    rag_prompt = build_rag_prompt(
+        user_question=user_question,
+        user_language=user_language,
+        messages=messages,
+        extra_context=extra_context,
+    )
+    rag_options = json.dumps(
+        {
+            "schema": cleaned_schema_scope,
+            "n_citations": 5,
+            "semantic_search": True,
+            "keyword_search": True,
+            "model_options": {
+                "model_id": model_id,
+                "language": user_language,
+                "max_tokens": 4000,
+            },
+        }
+    )
+
+    cursor, conn = get_safe_cursor(connection_params)
+    try:
+        cursor.execute("SET @rag_prompt = %s", (rag_prompt,))
+        cursor.execute("SET @rag_options = %s", (rag_options,))
+        cursor.execute("CALL sys.ML_RAG(@rag_prompt, @rag_output, @rag_options)")
+
+        for stored_result in cursor.stored_results():
+            try:
+                stored_result.close()
+            except Exception:
+                pass
+
+        cursor.execute("SELECT @rag_output")
+        row = cursor.fetchone()
+        raw_response = row[0] if row else None
+        parsed_response = parse_json_payload(raw_response)
+
+        if isinstance(parsed_response, dict):
+            text = str(
+                parsed_response.get("text")
+                or parsed_response.get("response")
+                or parsed_response.get("output")
+                or ""
+            ).strip()
+            citations = parsed_response.get("citations")
+            retrieval_info = parsed_response.get("retrieval_info")
+            vector_store = parsed_response.get("vector_store")
+        else:
+            text = str(parsed_response or "").strip()
+            citations = None
+            retrieval_info = None
+            vector_store = None
+
+        if not text and isinstance(parsed_response, dict):
+            text = json.dumps(parsed_response, indent=2, ensure_ascii=False)
+
+        return {
+            "text": text or "✅ ML_RAG completed with no text response.",
+            "citations": citations,
+            "retrieval_info": retrieval_info,
+            "vector_store": vector_store,
+        }
+    except mysql.connector.Error as err:
+        return {
+            "text": f"❌ ML_RAG failed: {err}",
+            "citations": None,
+            "retrieval_info": None,
+            "vector_store": None,
+        }
+    finally:
+        safe_close_cursor_conn(cursor, conn)
+
+
 def ensure_smart_ask_objects(connection_params: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """Ensure demo schema/log tables/procedures/triggers exist using external SQL files."""
     return apply_router_sql_bundle(connection_params)
@@ -681,16 +882,10 @@ def run_smart_ask(
     result_frames: List[pd.DataFrame] = []
 
     try:
-        cleaned_schema_scope: List[str] = []
-        for schema in schema_scope or []:
-            schema_name = str(schema).strip()
-            if schema_name and schema_name not in cleaned_schema_scope:
-                cleaned_schema_scope.append(schema_name)
-
-        if not cleaned_schema_scope:
-            fallback_schema = str(connection_params.get("database") or DB_NAME).strip()
-            if fallback_schema:
-                cleaned_schema_scope = [fallback_schema]
+        cleaned_schema_scope = normalize_schema_scope(
+            schema_scope,
+            fallback_schema=str(connection_params.get("database") or DB_NAME).strip(),
+        )
 
         schema_scope_json = json.dumps(cleaned_schema_scope)
         out_params = cursor.callproc("demo.smart_ask", (user_question, schema_scope_json, "", ""))
@@ -830,6 +1025,32 @@ def message_to_memory_text(message: Dict[str, Any]) -> str:
 def format_recent_turns(messages: List[Dict[str, Any]], max_turns: int = 12) -> str:
     """Format the last ~12 turns as Human/AI lines for LLM prompts."""
     relevant_messages = messages[-(max_turns * 2):]
+
+    if (
+        InMemoryChatMessageHistory is not None
+        and HumanMessage is not None
+        and AIMessage is not None
+    ):
+        history = InMemoryChatMessageHistory()
+        for msg in relevant_messages:
+            content = message_to_memory_text(msg)
+            if not content:
+                continue
+
+            if msg.get("role") == "user":
+                history.add_message(HumanMessage(content=content))
+            else:
+                history.add_message(AIMessage(content=content))
+
+        lines: List[str] = []
+        for msg in history.messages:
+            role = "Human" if msg.type == "human" else "AI"
+            content = str(msg.content).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+
+        return "\n".join(lines)
+
     lines: List[str] = []
 
     for msg in relevant_messages:
@@ -991,6 +1212,62 @@ def render_and_store_sql_response(
     )
 
 
+def render_rag_metadata(message: Dict[str, Any]) -> None:
+    citations = message.get("rag_citations")
+    retrieval_info = message.get("rag_retrieval_info")
+    vector_store = message.get("rag_vector_store")
+
+    if citations is None and retrieval_info is None and not vector_store:
+        return
+
+    with st.expander("RAG details", expanded=False):
+        if vector_store:
+            if isinstance(vector_store, list):
+                vector_store_list = [str(item).strip() for item in vector_store if str(item).strip()]
+            else:
+                vector_store_list = [str(vector_store).strip()]
+
+            if vector_store_list:
+                st.caption(f"Vector stores: {', '.join(vector_store_list)}")
+
+        if retrieval_info is not None:
+            st.write("Retrieval info")
+            st.json(retrieval_info)
+
+        if citations is not None:
+            st.write("Citations")
+            st.json(citations)
+
+
+def render_and_store_rag_response(
+    rag_output: Dict[str, Any],
+    message_mode: str,
+) -> None:
+    answer_text = str(rag_output.get("text", "")).strip()
+    st.markdown(answer_text)
+
+    message_payload = {
+        "role": "assistant",
+        "type": "text",
+        "content": answer_text,
+        "mode": message_mode,
+    }
+
+    citations = rag_output.get("citations")
+    retrieval_info = rag_output.get("retrieval_info")
+    vector_store = rag_output.get("vector_store")
+
+    if citations is not None:
+        message_payload["rag_citations"] = citations
+    if retrieval_info is not None:
+        message_payload["rag_retrieval_info"] = retrieval_info
+    if vector_store:
+        message_payload["rag_vector_store"] = vector_store
+
+    render_rag_metadata(message_payload)
+    st.session_state.messages.append(message_payload)
+
+
 # -----------------------------------------------------------------------------
 # UI helpers
 # -----------------------------------------------------------------------------
@@ -1042,6 +1319,7 @@ def render_chat_message(message: Dict[str, Any], show_generated_sql: bool) -> No
                     generated_sql = str(message.get("generated_sql", "")).strip()
                     if generated_sql:
                         st.code(generated_sql, language="sql")
+                render_rag_metadata(message)
                 return
 
         st.markdown(str(message.get("content", "")))
@@ -1050,6 +1328,8 @@ def render_chat_message(message: Dict[str, Any], show_generated_sql: bool) -> No
             generated_sql = str(message.get("generated_sql", "")).strip()
             if generated_sql:
                 st.code(generated_sql, language="sql")
+
+        render_rag_metadata(message)
 
 
 # -----------------------------------------------------------------------------
@@ -1060,7 +1340,7 @@ def render_chat_message(message: Dict[str, Any], show_generated_sql: bool) -> No
 def main() -> None:
     global DB_NAME
 
-    st.title("Chat Assistant with NL2SQL")
+    st.title("Chat Assistant with NL2SQL + RAG")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -1129,17 +1409,30 @@ def main() -> None:
         st.session_state[sql_scope_state_key] = cleaned_scope
 
         selected_sql_schemas = st.multiselect(
-            "Schemas for SQL inference (NL_SQL):",
+            "Schemas for SQL / RAG inference:",
             schema_list,
             key=sql_scope_state_key,
-            help="Choose one or more schemas to pass natively to sys.NL_SQL options.schemas.",
+            help=(
+                "Choose one or more schemas to pass to sys.NL_SQL options.schemas "
+                "and to sys.ML_RAG options.schema."
+            ),
         )
         if not selected_sql_schemas:
             selected_sql_schemas = [DB_NAME]
             st.session_state[sql_scope_state_key] = selected_sql_schemas
-        st.caption(f"SQL schema scope: {len(selected_sql_schemas)} selected")
+        st.caption(f"Schema scope: {len(selected_sql_schemas)} selected")
 
         connection_params = get_connection_params(selected_database=DB_NAME)
+        rag_vector_stores, rag_vector_store_error = discover_rag_vector_stores(
+            connection_params,
+            schema_scope=selected_sql_schemas,
+        )
+        if rag_vector_store_error:
+            st.caption(f"RAG vector store discovery failed: {rag_vector_store_error}")
+        elif rag_vector_stores:
+            st.caption(f"RAG vector stores: {', '.join(rag_vector_stores)}")
+        else:
+            st.caption("RAG vector stores: none discovered in the selected schemas")
 
         router_ready, router_error = ensure_smart_ask_objects(connection_params)
         if not router_ready and router_error:
@@ -1174,7 +1467,7 @@ def main() -> None:
                     f"using `{selected_model_id}`."
                 )
 
-        mode = st.selectbox("Mode", ["Auto", "Chat", "SQL"], index=0)
+        mode = st.selectbox("Mode", ["Auto", "Chat", "SQL", "RAG"], index=0)
 
         nl_disabled = selected_model_id in restricted_models
         override_nl = False
@@ -1277,6 +1570,20 @@ def main() -> None:
                             connection_params=connection_params,
                             message_mode="auto_sql",
                         )
+                    elif router_route in {"RAG", "FUSION"}:
+                        rag_output = {
+                            "text": router_answer or "✅ RAG completed with no text response.",
+                            "citations": None,
+                            "retrieval_info": None,
+                            "vector_store": rag_vector_stores,
+                        }
+                        render_and_store_rag_response(
+                            rag_output=rag_output,
+                            message_mode=f"auto_{router_route.lower()}",
+                        )
+
+                        if show_sql == "Yes" and generated_sql:
+                            st.code(generated_sql, language="sql")
                     else:
                         context_for_llm = (
                             f"smart_ask route: {router_route}\n"
@@ -1356,6 +1663,42 @@ def main() -> None:
                     connection_params=connection_params,
                     message_mode="sql",
                 )
+            elif active_mode == "rag":
+                if not rag_vector_stores:
+                    if rag_vector_store_error:
+                        missing_store_message = (
+                            "❌ ML_RAG could not run because vector store discovery failed: "
+                            f"{rag_vector_store_error}"
+                        )
+                    else:
+                        missing_store_message = (
+                            "❌ ML_RAG could not run because HeatWave did not discover any vector store "
+                            f"tables in the selected schemas: {', '.join(selected_sql_schemas)}."
+                        )
+                    render_and_store_rag_response(
+                        rag_output={
+                            "text": missing_store_message,
+                            "citations": None,
+                            "retrieval_info": None,
+                            "vector_store": None,
+                        },
+                        message_mode="rag",
+                    )
+                else:
+                    with st.spinner("Running RAG..."):
+                        rag_output = run_ml_rag(
+                            user_question=prompt,
+                            model_id=selected_model_id,
+                            connection_params=connection_params,
+                            schema_scope=selected_sql_schemas,
+                            user_language=language,
+                            messages=st.session_state.messages,
+                        )
+
+                    render_and_store_rag_response(
+                        rag_output=rag_output,
+                        message_mode="rag",
+                    )
 
     add_footer()
 
