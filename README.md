@@ -1,13 +1,14 @@
 # NL2SQL
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-This repository contains a Streamlit app for querying an Oracle HeatWave instance with natural language. The app supports three modes:
+This repository contains a Streamlit app for querying an Oracle HeatWave instance with natural language. The app supports four modes:
 
 - `Auto`: routes each prompt through `demo.smart_ask` when the router bundle is available
 - `Chat`: uses `sys.ML_GENERATE` for conversational responses with memory
 - `SQL`: uses `sys.NL_SQL` to generate and execute SQL against selected schemas
+- `RAG`: uses `sys.ML_RAG` with schema-scoped retrieval against HeatWave-discoverable vector stores
 
-The app also supports optional result explanations, schema scoping, and thumbs up/down feedback for router outputs.
+The app also supports optional result explanations, schema scoping shared by `SQL` and `RAG`, RAG retrieval diagnostics, and thumbs up/down feedback for router outputs.
 
 ---
 
@@ -89,7 +90,7 @@ Start the app with:
 streamlit run nl2sql_app.py
 ```
 
-The sidebar loads available models from `sys.ML_SUPPORTED_LLMS`, lets you choose a model preset or catalog entry, and lets you pick one or more schemas for `SQL` inference.
+The sidebar loads available models from `sys.ML_SUPPORTED_LLMS`, lets you choose a model preset or catalog entry, and lets you pick one or more schemas for `SQL` and `RAG` inference.
 
 ---
 
@@ -98,8 +99,11 @@ The sidebar loads available models from `sys.ML_SUPPORTED_LLMS`, lets you choose
 - `Auto` mode routes database-oriented prompts through `demo.smart_ask` when the router bundle is available, and falls back to `Chat` for conversational input or when the router objects are unavailable.
 - `Chat` mode sends the conversation history to `sys.ML_GENERATE`.
 - `SQL` mode sends the prompt to `sys.NL_SQL` and renders the result table when one is returned.
+- `RAG` mode sends the prompt plus recent conversation context to `sys.ML_RAG` and restricts retrieval with `options.schema` using the selected schemas.
+- `Auto` mode now renders router-produced `RAG` and `FUSION` answers directly instead of collapsing them back into chat.
 - If `Explain result in natural language` is enabled, the app explains small SQL result sets with `sys.ML_GENERATE`.
 - When `Show generated SQL?` is enabled, the UI prints the generated SQL below the result.
+- The sidebar shows which vector store tables HeatWave can discover for the current schema selection.
 - The router bundle in `sql/router/` creates the `demo` schema objects used for caching, route metrics, schema hints, and feedback.
 
 The current flow is summarized in [docs/app_flowchart.md](/Users/oscarden/Desktop/AutoML/NL2SQL/docs/app_flowchart.md) and illustrated by [resources/diagram.svg](/Users/oscarden/Desktop/AutoML/NL2SQL/resources/diagram.svg).
@@ -109,6 +113,8 @@ The current flow is summarized in [docs/app_flowchart.md](/Users/oscarden/Deskto
 ## Database Requirements
 
 The app works at the database/schema level. It queries the selected schema and uses table and column metadata, including column comments, to improve SQL generation.
+
+`RAG` mode requires at least one HeatWave-discoverable vector store table in the selected schemas. The app uses `sys.ML_RETRIEVE_VECTOR_TABLES` to discover those tables and then calls `sys.ML_RAG` with `options.schema = [...]`.
 
 If your schema does not already include useful comments, add them before using `SQL` mode. The app is much more reliable when columns have concise descriptions.
 
